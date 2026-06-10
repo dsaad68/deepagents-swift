@@ -15,6 +15,8 @@ Configs live at `.swiftformat` and `.swiftlint.yml`, and are reconciled so the t
 Use the DeepWiki MCP to look up package and library details directly from their source repositories.
 If the available documentation is unclear or incomplete, ask DeepWiki follow-up questions before making assumptions.
 
+- https://github.com/ml-explore/mlx-swift
+- https://github.com/ml-explore/mlx-swift-examples
 - https://github.com/ml-explore/mlx-swift-lm
 - https://github.com/langchain-ai/deepagents
 - https://github.com/langchain-ai/langchain
