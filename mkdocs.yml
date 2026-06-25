@@ -1,0 +1,128 @@
+site_name: DeepAgents
+site_description: >-
+  An inference-agnostic agent framework for Swift - a ReAct loop, a composable
+  middleware system, an MCP client, and generic toolsets, with adapters for
+  on-device MLX, OpenAI, Anthropic, and macOS.
+site_url: https://deepagents-swift.verybad.engineer/
+site_author: Daniel Saad
+copyright: Copyright &copy; Daniel Saad - MIT licensed
+
+repo_url: https://github.com/dsaad68/deepagents-swift
+repo_name: dsaad68/deepagents-swift
+edit_uri: ""
+
+theme:
+  name: material
+  font: false
+  language: en
+  icon:
+    repo: fontawesome/brands/github
+  logo: assets/images/deepagents-logo.png
+  favicon: assets/images/favicon.svg
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - navigation.instant
+    - navigation.instant.progress
+    - navigation.tracking
+    - navigation.indexes
+    - navigation.footer
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - search.share
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+    - announce.dismiss
+
+extra_css:
+  - assets/stylesheets/extra.css
+
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+      title: On this page
+  - pymdownx.details
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.snippets
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+plugins:
+  - search
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/dsaad68/deepagents-swift
+      name: DeepAgents on GitHub
+
+nav:
+  - Home: index.md
+  - Getting started:
+      - Installation: getting-started/installation.md
+      - Quickstart: getting-started/quickstart.md
+  - Concepts:
+      - Architecture: concepts/architecture.md
+      - The agent loop: concepts/agent-loop.md
+      - Messages & content: concepts/messages.md
+      - Middleware: concepts/middleware.md
+      - Tools & policy: concepts/tools.md
+      - Memory & checkpointing: concepts/memory.md
+      - Subagents: concepts/subagents.md
+      - Summarization: concepts/summarization.md
+      - Human in the loop: concepts/human-in-the-loop.md
+      - MCP client: concepts/mcp.md
+  - Adapters:
+      - adapters/index.md
+      - MLX (on-device): adapters/mlx.md
+      - OpenAI & Azure: adapters/openai.md
+      - Anthropic & Bedrock: adapters/anthropic.md
+      - macOS tools: adapters/mac-tools.md
+  - Guides:
+      - Build a custom ChatModel: guides/custom-chat-model.md
+      - Write a custom tool: guides/custom-tool.md
+      - Write custom middleware: guides/custom-middleware.md
+      - Connect MCP servers: guides/mcp.md
+      - Gate tools with approvals: guides/approvals.md
+  - API reference: reference/index.md
+  - License: license.md
