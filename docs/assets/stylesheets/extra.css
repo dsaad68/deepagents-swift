@@ -1,0 +1,95 @@
+/* ============================================================================
+   DeepAgents - self-hosted typography + brand theme
+   Headings  : Satoshi (bold)  (ITF Free Font License)
+   Body      : Satoshi         (ITF Free Font License)
+   Display   : Gambarino       (ITF Free Font License - bundled, currently unused)
+   Code/mono : Fira Code       (SIL Open Font License 1.1)
+   Attribution: assets/fonts/FONTS.md. No Google Fonts are requested at runtime.
+   ========================================================================== */
+
+@font-face { font-family: "Satoshi"; src: url("../fonts/Satoshi-300.woff2") format("woff2"); font-weight: 300; font-style: normal; font-display: swap; }
+@font-face { font-family: "Satoshi"; src: url("../fonts/Satoshi-400.woff2") format("woff2"); font-weight: 400; font-style: normal; font-display: swap; }
+@font-face { font-family: "Satoshi"; src: url("../fonts/Satoshi-500.woff2") format("woff2"); font-weight: 500; font-style: normal; font-display: swap; }
+@font-face { font-family: "Satoshi"; src: url("../fonts/Satoshi-700.woff2") format("woff2"); font-weight: 700; font-style: normal; font-display: swap; }
+@font-face { font-family: "Gambarino"; src: url("../fonts/Gambarino-400.woff2") format("woff2"); font-weight: 400; font-style: normal; font-display: swap; }
+@font-face { font-family: "Fira Code"; src: url("../fonts/FiraCode-400.woff2") format("woff2"); font-weight: 400; font-style: normal; font-display: swap; }
+@font-face { font-family: "Fira Code"; src: url("../fonts/FiraCode-500.woff2") format("woff2"); font-weight: 500; font-style: normal; font-display: swap; }
+@font-face { font-family: "Fira Code"; src: url("../fonts/FiraCode-700.woff2") format("woff2"); font-weight: 700; font-style: normal; font-display: swap; }
+
+:root {
+  --md-text-font: "Satoshi";
+  --md-code-font: "Fira Code";
+
+  /* Brand: deep teal -> cyan */
+  --md-primary-fg-color:        #0f766e;
+  --md-primary-fg-color--light: #14b8a6;
+  --md-primary-fg-color--dark:  #0b5a54;
+  --md-accent-fg-color:         #06b6d4;
+  --brand-gradient: linear-gradient(135deg, #0f766e 0%, #06b6d4 100%);
+}
+
+/* Links + interactive accent in dark scheme read better a touch brighter */
+[data-md-color-scheme="slate"] {
+  --md-primary-fg-color: #14b8a6;
+  --md-accent-fg-color:  #22d3ee;
+  --md-typeset-a-color:  #2dd4bf;
+}
+
+/* ---- Headings: Satoshi (bold) ------------------------------------------- */
+/* Gambarino is still declared via @font-face above; to bring the serif brand mark
+   back, swap the font-family below (and on .hero h1) to "Gambarino". */
+.md-typeset h1, .md-typeset h2, .md-typeset h3,
+.md-typeset h4, .md-typeset h5, .md-typeset h6 {
+  font-family: "Satoshi", -apple-system, BlinkMacSystemFont, sans-serif;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+.md-typeset h1 { font-size: 2.3rem;  line-height: 1.2;  color: var(--md-default-fg-color); }
+.md-typeset h2 { font-size: 1.65rem; line-height: 1.25; margin-top: 2.4em; }
+.md-typeset h3 { font-size: 1.3rem; }
+.md-typeset h4, .md-typeset h5, .md-typeset h6 { font-weight: 500; letter-spacing: -0.01em; }
+.md-header__title { font-family: "Satoshi", sans-serif; font-weight: 700; font-size: 1.0rem; letter-spacing: -0.01em; }
+
+/* Header navigation tabs - heavier so they read clearly on the brand bar */
+.md-tabs__link { font-weight: 600; opacity: 0.9; }
+.md-tabs__link--active { font-weight: 700; opacity: 1; }
+
+/* Larger header logo (the mark next to the title) */
+.md-header__button.md-logo img,
+.md-header__button.md-logo svg { height: 1.9rem; width: auto; }
+
+/* Crisper body rendering */
+body { -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
+.md-typeset { font-size: 0.84rem; }
+
+/* ---- Hero (home page) --------------------------------------------------- */
+.hero { text-align: center; padding: 2.2rem 0 0.6rem; }
+.hero h1 {
+  font-family: "Satoshi", sans-serif;
+  font-weight: 700;
+  font-size: 3.0rem; line-height: 1.15; letter-spacing: -0.03em; margin: 0.2rem 0 0.4rem;
+  padding-bottom: 0.14em;            /* room for descenders under background-clip: text */
+  background: var(--brand-gradient);
+  -webkit-background-clip: text; background-clip: text;
+  -webkit-text-fill-color: transparent; color: transparent;
+}
+.hero .tagline {
+  font-size: 1.12rem; font-weight: 400;
+  color: var(--md-default-fg-color--light);
+  max-width: 42rem; margin: 0 auto 1.4rem;
+}
+.hero .md-button { margin: 0.3rem 0.3rem; }
+.hero .md-button--primary { background: var(--md-primary-fg-color); border-color: var(--md-primary-fg-color); }
+
+/* ---- Feature grid (home page cards) ------------------------------------- */
+.grid.cards > ul > li,
+.md-typeset .grid.cards > ul > li { border-radius: 0.6rem; }
+.md-typeset .grid.cards > ul > li:hover { box-shadow: 0 0.4rem 1.2rem rgba(0,0,0,0.08); }
+
+/* ---- Code blocks -------------------------------------------------------- */
+.md-typeset code, .md-typeset pre > code { font-feature-settings: "liga" 1, "calt" 1; }
+.md-typeset pre > code { font-size: 0.74rem; line-height: 1.55; }
+
+/* ---- Tables: lighter, roomier ------------------------------------------- */
+.md-typeset table:not([class]) th { font-weight: 700; }
+.md-typeset table:not([class]) { font-size: 0.72rem; }
