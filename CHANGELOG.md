@@ -16,6 +16,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   names are now sanitized to `[A-Za-z0-9_]` (the server is still invoked with its original tool
   name), and `ReactAgent` falls back to a case- and `-`/`_`-insensitive match when exactly one tool
   fits.
+- **A tool reached by name drift skipped its approval gate.** `ReactAgent` now falls back to a
+  fuzzy match when a model misspells a tool name, but it forwarded the model's spelling into the
+  middleware chain. `HumanInTheLoopMiddleware` looks its gate up by the name on the request and
+  deny enforcement lives inside the handler that lookup guards, so a fuzzy-matched call ran an
+  "Ask" - or a "Deny" - tool with no approval at all. The resolved tool's canonical name is now
+  substituted into the call before dispatch, so the gate, the deny list and the emitted events all
+  key on the same name. The model's call id is preserved.
 - **The duplicate-round guard told the model a failed call had a result.** A call that errored and
   was re-issued unchanged drew "its result is in the conversation above", so the model answered
   from a result that never existed (observed: an unfetched web page summarized as fact). A repeat

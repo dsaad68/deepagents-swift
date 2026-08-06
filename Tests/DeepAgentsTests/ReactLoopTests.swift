@@ -214,6 +214,27 @@ struct ReactLoopTests {
         #expect(ReactAgent.resolveTool(named: "A_B__RUN", in: ambiguous) == nil)
     }
 
+    @Test func aToolReachedByNameDriftIsStillApprovalGated() async {
+        // The drifted name only selects the tool; dispatch then continues under the canonical
+        // one. `HumanInTheLoopMiddleware` looks its gate up by the name on the request, and deny
+        // enforcement lives inside the handler that lookup guards - so forwarding the model's
+        // spelling would run an "Ask" (or "Deny") tool with no approval at all.
+        let spy = ApprovalSpy()
+        let agent = createAgent(
+            model: StuckToolModel(toolName: "Parallel_Search__Web_Search", finalAnswer: "done"),
+            tools: [StubNamedTool("parallel_search__web_search")],
+            middleware: [HumanInTheLoopMiddleware(
+                interruptOn: ["parallel_search__web_search": InterruptOnConfig()],
+                approvalHandler: spy.handler
+            )],
+            maxIterations: 4
+        )
+
+        _ = await agent.collect([.human("search")])
+
+        #expect(await spy.names == ["parallel_search__web_search"])
+    }
+
     @Test func legitimateRepeatWithDifferentArgumentsIsNotStopped() async {
         let c1 = AgentToolCall(name: "echo", arguments: ["text": .string("one")])
         let c2 = AgentToolCall(name: "echo", arguments: ["text": .string("two")])
@@ -435,5 +456,20 @@ private struct ProbeToolMiddleware: AgentMiddleware {
         let sawAI = request.state.messages.contains { !$0.toolCalls.isEmpty }
         await probe.mark(sawAI)
         return try await handler(request)
+    }
+}
+
+/// Records the tool names the approval gate was actually shown, and rejects every one so a
+/// gated run can't proceed to execute the tool.
+private actor ApprovalSpy {
+    private(set) var names: [String] = []
+
+    private func record(_ request: ToolApprovalRequest) -> ToolApprovalDecision {
+        names.append(request.toolName)
+        return .reject(message: "no")
+    }
+
+    nonisolated var handler: ToolApprovalHandler {
+        { await self.record($0) }
     }
 }

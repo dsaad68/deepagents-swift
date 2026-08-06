@@ -466,14 +466,23 @@ public struct ReactAgent: Sendable {
         state: AgentState,
         onEvent: @Sendable @escaping (AgentEvent) -> Void
     ) async -> (message: AgentMessage, stateUpdate: AgentStateUpdate?, failed: Bool) {
-        onEvent(.toolStarted(name: call.name, input: call.describedArguments))
-
         guard let tool = Self.resolveTool(named: call.name, in: tools) else {
             let names = tools.map(\.name).joined(separator: ", ")
             let text = Self.errorJSON("Unknown tool '\(call.name)'. Available tools: \(names).")
             onEvent(.toolFailed(name: call.name, error: text))
             return (.tool(text, toolCallID: call.id), nil, true)
         }
+
+        // The model's spelling of the name only ever *selects* the tool; from here on the
+        // canonical `tool.name` is used. Everything downstream keys on the name in the request -
+        // `HumanInTheLoopMiddleware` looks up `interruptOn[request.call.name]`, and deny
+        // enforcement lives inside the handler that lookup gates - so passing a fuzzy-matched
+        // name straight through would miss the gate and run an "Ask" (or "Deny") tool unapproved.
+        // The call id is the model's and must survive, since the result message is paired to it.
+        let call = call.name == tool.name
+            ? call
+            : AgentToolCall(id: call.id, name: tool.name, arguments: call.arguments)
+        onEvent(.toolStarted(name: call.name, input: call.describedArguments))
 
         // Validate the call against the tool's declared schema before executing — the
         // on-device stand-in for Outlines-style schema enforcement (mlx-swift has no
