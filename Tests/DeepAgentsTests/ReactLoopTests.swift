@@ -175,6 +175,45 @@ struct ReactLoopTests {
         #expect(events.finalAnswer == "forced answer")
     }
 
+    @Test func repeatedFailingCallIsToldItFailedRatherThanRedirectedToAResult() async {
+        // The repeated call never produced a result - it failed as an unknown tool. The
+        // redirect must say so: told "its result is in the conversation above", a model
+        // answers from a result that does not exist.
+        let agent = createAgent(
+            model: StuckToolModel(toolName: "ecko", finalAnswer: "forced answer"),
+            tools: [EchoTool()],
+            maxIterations: 10
+        )
+
+        let (ok, events) = await agent.collect([.human("loop")])
+
+        #expect(ok)
+        let failures = events.toolFailures.filter { $0.name == "ecko" }.map(\.error)
+        #expect(failures.first?.contains("Unknown tool") == true)
+        let redirect = failures.count > 1 ? failures[1] : ""
+        #expect(redirect.contains("it failed"))
+        #expect(!redirect.contains("its result is "))
+    }
+
+    @Test func toolNameResolutionToleratesHyphenAndCaseDrift() {
+        // Small models rewrite a namespaced name's punctuation while emitting the call
+        // (`parallel-search__web_search` → `parallel_search__web_search`). An unambiguous
+        // match still dispatches instead of failing as an unknown tool.
+        let tools: [any AgentTool] = [EchoTool(), StubNamedTool("parallel_search__web_search")]
+
+        #expect(ReactAgent.resolveTool(named: "parallel-search__web_search", in: tools)?.name
+            == "parallel_search__web_search")
+        #expect(ReactAgent.resolveTool(named: "Echo", in: tools)?.name == "echo")
+        #expect(ReactAgent.resolveTool(named: "echo", in: tools)?.name == "echo")
+        #expect(ReactAgent.resolveTool(named: "no_such_tool", in: tools) == nil)
+        // Ambiguity is not guessed at: two tools folding to the same name stay unresolved.
+        let ambiguous: [any AgentTool] = [
+            StubNamedTool("a-b__run"), StubNamedTool("a_b__run")
+        ]
+        #expect(ReactAgent.resolveTool(named: "a_b__run", in: ambiguous)?.name == "a_b__run") // exact wins
+        #expect(ReactAgent.resolveTool(named: "A_B__RUN", in: ambiguous) == nil)
+    }
+
     @Test func legitimateRepeatWithDifferentArgumentsIsNotStopped() async {
         let c1 = AgentToolCall(name: "echo", arguments: ["text": .string("one")])
         let c2 = AgentToolCall(name: "echo", arguments: ["text": .string("two")])

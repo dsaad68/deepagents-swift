@@ -140,7 +140,9 @@ let ok = await agent.run([.human("Summarize the latest news on Swift concurrency
 
 ## Tool namespacing
 
-MCP tools are namespaced with their server name using double underscores: `server__tool_name`. For example, a `read_file` tool from a server named `filesystem-mcp` becomes `filesystem-mcp__read_file` in the agent's tool list. This prevents collisions when multiple servers expose tools with the same name.
+MCP tools are namespaced with their server name using double underscores: `server__tool_name`. For example, a `read_file` tool from a server named `filesystem-mcp` becomes `filesystem_mcp__read_file` in the agent's tool list. This prevents collisions when multiple servers expose tools with the same name.
+
+Both halves are sanitized to `[A-Za-z0-9_]` - any other character, hyphens included, becomes `_`. Hyphens are folded because models are trained on `[A-Za-z0-9_]` function names and normalize one away when emitting a call, which exact-match dispatch would then reject as an unknown tool. The server is still invoked with its original tool name, so only the name the model sees changes. Two servers that sanitize to the same prefix are disambiguated with a numeric suffix (`server__tool_2`), and dispatch also falls back to a case- and `-`/`_`-insensitive match when exactly one tool fits.
 
 ---
 

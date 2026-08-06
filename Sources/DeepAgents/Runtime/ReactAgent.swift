@@ -63,6 +63,7 @@ public struct ReactAgent: Sendable {
             // round's call set; after `maxRepeatedRounds` consecutive repeats, stop
             // dispatching and force a final answer instead of burning the iteration cap.
             var previousSignature: [String]?
+            var previousRoundFailed = false
             var repeatedRounds = 0
 
             agentLoop: while true {
@@ -129,12 +130,13 @@ public struct ReactAgent: Sendable {
                 }
                 if repeatedRounds > 0 {
                     await appendDuplicateFeedback(
-                        calls, state: &state, round: round, threadId: threadId, onEvent: onEvent
+                        RepeatedRound(calls: calls, previouslyFailed: previousRoundFailed),
+                        state: &state, round: round, threadId: threadId, onEvent: onEvent
                     )
                     continue agentLoop
                 }
 
-                await dispatchRound(
+                previousRoundFailed = await dispatchRound(
                     response.message, state: &state, round: round,
                     threadId: threadId, onEvent: onEvent
                 )
@@ -231,19 +233,23 @@ public struct ReactAgent: Sendable {
     /// Dispatch one round's tool calls (from the model's message), appending every result
     /// to the conversation so the model (next round) and any later tool this round see the
     /// full exchange; also feeds back the round's malformed blocks (if any) and surfaces
-    /// todo-list updates.
+    /// todo-list updates. Returns whether every call in the round failed, which the
+    /// duplicate-round guard uses to word its redirect truthfully.
+    @discardableResult
     private func dispatchRound(
         _ message: AgentMessage,
         state: inout AgentState,
         round: Int,
         threadId: String?,
         onEvent: @Sendable @escaping (AgentEvent) -> Void
-    ) async {
+    ) async -> Bool {
         var todosTouched = false
+        var failures = 0
         for call in message.toolCalls {
-            let (result, update) = await dispatchTool(
+            let (result, update, failed) = await dispatchTool(
                 call, tools: tools, state: state, onEvent: onEvent
             )
+            if failed { failures += 1 }
             merge(update, into: &state.values)
             if update?.values["todos"] != nil { todosTouched = true }
             state.messages.append(result)
@@ -257,6 +263,14 @@ public struct ReactAgent: Sendable {
         if todosTouched, let todos = state.values["todos"] as? [TodoItem] {
             onEvent(.todosUpdated(todos))
         }
+        return !message.toolCalls.isEmpty && failures == message.toolCalls.count
+    }
+
+    /// A repeated call set together with how its first execution went - the two facts
+    /// `appendDuplicateFeedback` needs to word its redirect.
+    private struct RepeatedRound {
+        let calls: [AgentToolCall]
+        let previouslyFailed: Bool
     }
 
     /// Feed back a redirect instead of re-executing a consecutive-duplicate call set:
@@ -265,16 +279,27 @@ public struct ReactAgent: Sendable {
     /// ~7s a round). Each duplicate call still gets a `tool`-role response — the trained
     /// chat format pairs every emitted call with a result, so skipping silently would be
     /// off-distribution.
+    ///
+    /// `repeated.previouslyFailed` swaps the wording when the repeated round produced only
+    /// errors. Telling the model its result "is in the conversation above" when the conversation
+    /// holds an error is a lie it acts on: observed on-device, an unknown-tool failure repeated
+    /// once drew the redirect, and the model then answered from a web fetch it never made.
     private func appendDuplicateFeedback(
-        _ calls: [AgentToolCall],
+        _ repeated: RepeatedRound,
         state: inout AgentState,
         round: Int,
         threadId: String?,
         onEvent: @Sendable @escaping (AgentEvent) -> Void
     ) async {
-        for call in calls {
+        for call in repeated.calls {
             let text = Self.errorJSON(
-                "You already called \(call.name) with the same arguments - its result is "
+                repeated.previouslyFailed
+                    ? "You already called \(call.name) with the same arguments and it failed - "
+                    + "the error is in the conversation above, and repeating the call unchanged "
+                    + "will fail the same way. Fix what the error reports (check the tool name "
+                    + "against the tool list, or the arguments), call a different tool, or answer "
+                    + "the user now with what you have."
+                    : "You already called \(call.name) with the same arguments - its result is "
                     + "in the conversation above. Use that result, call a different tool, "
                     + "or answer the user now."
             )
@@ -412,23 +437,42 @@ public struct ReactAgent: Sendable {
 
     // MARK: - Tool dispatch
 
+    /// The tool a call names: exact match first, then a forgiving one that folds case and the
+    /// `-`/`_` distinction. Small models rewrite a namespaced name's punctuation while reasoning
+    /// about the right tool (`parallel-search__web_search` emitted as `parallel_search__web_search`),
+    /// and answering "unknown tool" to a call that unambiguously means one of ours wastes a round -
+    /// or, worse, sends the run down the duplicate-call path. The fallback applies only when exactly
+    /// one tool matches, so a genuine ambiguity still surfaces as an error.
+    static func resolveTool(named name: String, in tools: [any AgentTool]) -> (any AgentTool)? {
+        if let exact = tools.first(where: { $0.name == name }) { return exact }
+        let wanted = foldedToolName(name)
+        let matches = tools.filter { foldedToolName($0.name) == wanted }
+        return matches.count == 1 ? matches[0] : nil
+    }
+
+    /// A tool name reduced to what a model reliably reproduces: lowercase, hyphens as underscores.
+    private static func foldedToolName(_ name: String) -> String {
+        name.lowercased().replacingOccurrences(of: "-", with: "_")
+    }
+
     /// Execute one tool call through the `wrapToolCall` middleware chain. Returns the
-    /// `.tool` result message (tagged with the originating call's id) plus any state
-    /// update the tool produced. Errors are caught and returned as text so the model can
-    /// recover rather than aborting.
+    /// `.tool` result message (tagged with the originating call's id), any state update the
+    /// tool produced, and whether the call failed. Errors are caught and returned as text so
+    /// the model can recover rather than aborting; `failed` lets the duplicate-round guard
+    /// tell "you already have this result" from "this call already errored".
     private func dispatchTool(
         _ call: AgentToolCall,
         tools: [any AgentTool],
         state: AgentState,
         onEvent: @Sendable @escaping (AgentEvent) -> Void
-    ) async -> (message: AgentMessage, stateUpdate: AgentStateUpdate?) {
+    ) async -> (message: AgentMessage, stateUpdate: AgentStateUpdate?, failed: Bool) {
         onEvent(.toolStarted(name: call.name, input: call.describedArguments))
 
-        guard let tool = tools.first(where: { $0.name == call.name }) else {
+        guard let tool = Self.resolveTool(named: call.name, in: tools) else {
             let names = tools.map(\.name).joined(separator: ", ")
             let text = Self.errorJSON("Unknown tool '\(call.name)'. Available tools: \(names).")
             onEvent(.toolFailed(name: call.name, error: text))
-            return (.tool(text, toolCallID: call.id), nil)
+            return (.tool(text, toolCallID: call.id), nil, true)
         }
 
         // Validate the call against the tool's declared schema before executing — the
@@ -438,7 +482,7 @@ public struct ReactAgent: Sendable {
         if let violation = Self.schemaViolation(call, tool: tool) {
             let text = Self.errorJSON(violation)
             onEvent(.toolFailed(name: call.name, error: text))
-            return (.tool(text, toolCallID: call.id), nil)
+            return (.tool(text, toolCallID: call.id), nil, true)
         }
 
         let context = ToolContext(state: state, onEvent: onEvent)
@@ -465,11 +509,11 @@ public struct ReactAgent: Sendable {
             let imageURL = (captured.value?.values[ScreenshotState.pendingKey] as? [URL])?.first
             let editDiff = captured.value?.values[EditDiffState.pendingKey] as? FileDiff
             onEvent(.toolCompleted(name: call.name, result: message.text, imageURL: imageURL, editDiff: editDiff))
-            return (message, captured.value)
+            return (message, captured.value, false)
         } catch {
             let text = Self.errorJSON(Self.describe(error))
             onEvent(.toolFailed(name: call.name, error: text))
-            return (.tool(text, toolCallID: call.id), nil)
+            return (.tool(text, toolCallID: call.id), nil, true)
         }
     }
 

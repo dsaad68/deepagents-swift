@@ -12,9 +12,17 @@ import Testing
 struct MCPMappingTests {
     @Test("dispatchPrefix sanitizes the server name")
     func dispatchPrefix() {
-        #expect(MCPTool.dispatchPrefix(forServer: "parallel-search") == "parallel-search__")
+        #expect(MCPTool.dispatchPrefix(forServer: "parallel-search") == "parallel_search__")
         #expect(MCPTool.dispatchPrefix(forServer: "deepwiki") == "deepwiki__")
         #expect(MCPTool.dispatchPrefix(forServer: "my server") == "my_server__") // space → underscore
+    }
+
+    @Test("dispatchName exposes no hyphen — models normalize one away when emitting a call")
+    func dispatchNameFoldsHyphens() {
+        #expect(MCPTool.dispatchName(server: "parallel-search", tool: "web_search")
+            == "parallel_search__web_search")
+        #expect(MCPTool.dispatchName(server: "deepwiki", tool: "read-wiki-contents")
+            == "deepwiki__read_wiki_contents")
     }
 
     @Test("mcpApprovalDefaults maps each tool to its server's mode; unmatched tools get none")
@@ -24,15 +32,15 @@ struct MCPMappingTests {
             MCPServerConfig(name: "deepwiki", kind: .http, approvalMode: .approve)
         ]
         let tools: [any AgentTool] = [
-            StubTool("parallel-search__web_search"),
-            StubTool("parallel-search__web_fetch"),
+            StubTool("parallel_search__web_search"),
+            StubTool("parallel_search__web_fetch"),
             StubTool("deepwiki__ask"),
             StubTool("other__thing") // belongs to no configured server
         ]
         let defaults = mcpApprovalDefaults(servers: servers, tools: tools)
 
-        #expect(defaults["parallel-search__web_search"] == .ask)
-        #expect(defaults["parallel-search__web_fetch"] == .ask)
+        #expect(defaults["parallel_search__web_search"] == .ask)
+        #expect(defaults["parallel_search__web_fetch"] == .ask)
         #expect(defaults["deepwiki__ask"] == .approve)
         #expect(defaults["other__thing"] == nil)
     }
@@ -40,15 +48,15 @@ struct MCPMappingTests {
     @Test("mcpToolsForDisplay attributes tools to a server, strips the prefix, keeps the schema")
     func displayProjection() {
         let tools: [any AgentTool] = [
-            SchemaTool("parallel-search__web_search", description: "Search the web"),
-            SchemaTool("parallel-search__web_fetch", description: "Fetch a URL"),
+            SchemaTool("parallel_search__web_search", description: "Search the web"),
+            SchemaTool("parallel_search__web_fetch", description: "Fetch a URL"),
             SchemaTool("deepwiki__ask", description: "Ask the wiki")
         ]
 
         let parallel = mcpToolsForDisplay(server: "parallel-search", in: tools)
         #expect(parallel.map(\.name).sorted() == ["web_fetch", "web_search"])
         let search = parallel.first { $0.name == "web_search" }
-        #expect(search?.dispatchName == "parallel-search__web_search")
+        #expect(search?.dispatchName == "parallel_search__web_search")
         #expect(search?.description == "Search the web")
         #expect(search?.schema["type"] as? String == "object")
 

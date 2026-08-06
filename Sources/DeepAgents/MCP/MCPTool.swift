@@ -34,7 +34,7 @@ public struct MCPTool: AgentTool {
     var nameOverride: String?
 
     /// The namespaced name the model and `ReactAgent` dispatch on. Both components are
-    /// sanitized to `[A-Za-z0-9_-]` because a user-chosen server name (or an unusual
+    /// sanitized to `[A-Za-z0-9_]` because a user-chosen server name (or an unusual
     /// server-side tool name) containing spaces/punctuation may not round-trip through the
     /// chat template and tool-call parser, which would make `ReactAgent`'s exact-match
     /// dispatch fail with "unknown tool". The server is still invoked with the original
@@ -54,11 +54,17 @@ public struct MCPTool: AgentTool {
         "\(sanitize(server))__"
     }
 
-    /// Map any character outside `[A-Za-z0-9_-]` to `_`; never returns an empty string.
+    /// Map any character outside `[A-Za-z0-9_]` to `_`; never returns an empty string.
+    ///
+    /// Hyphens are folded too, even though they are legal in a function name: models are trained
+    /// on `[A-Za-z0-9_]` function names and normalize a hyphen away when *emitting* a call. Seen
+    /// on-device with the `parallel-search` server - the model reasoned about
+    /// `parallel-search__web_search` but emitted `parallel_search__web_search`, which exact-match
+    /// dispatch rejected as an unknown tool. Exposing a hyphen-free name removes the trap; the
+    /// server is still called with its original `toolName`.
     static func sanitize(_ component: String) -> String {
         let mapped = component.map { character -> Character in
-            character.isASCII && (character.isLetter || character.isNumber || character == "_"
-                || character == "-")
+            character.isASCII && (character.isLetter || character.isNumber || character == "_")
                 ? character : "_"
         }
         return mapped.isEmpty ? "_" : String(mapped)

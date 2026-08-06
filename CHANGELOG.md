@@ -7,6 +7,21 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Fixed
+
+- **MCP tools from a hyphenated server were unreachable.** `MCPTool.sanitize` kept hyphens, so a
+  server named `parallel-search` exposed `parallel-search__web_search` - but models normalize a
+  hyphen out of a function name when emitting the call, and `ReactAgent`'s exact-match dispatch
+  answered "unknown tool" to the `parallel_search__web_search` that came back. Namespaced dispatch
+  names are now sanitized to `[A-Za-z0-9_]` (the server is still invoked with its original tool
+  name), and `ReactAgent` falls back to a case- and `-`/`_`-insensitive match when exactly one tool
+  fits.
+- **The duplicate-round guard told the model a failed call had a result.** A call that errored and
+  was re-issued unchanged drew "its result is in the conversation above", so the model answered
+  from a result that never existed (observed: an unfetched web page summarized as fact). A repeat
+  of a round whose calls all failed now gets told the call failed and to fix the name, use another
+  tool, or answer with what it has.
+
 ## [0.4.0] - 2026-08-05
 
 ### Added
