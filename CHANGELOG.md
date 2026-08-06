@@ -7,6 +7,33 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- **The prefix KV store can be inspected and reclaimed.** `PrefixKVStore.inventory(directory:
+  knownModelIDs:)` reports what is on disk grouped by model, with per-model and total byte counts;
+  `removeAll(modelID:)` / `removeAll()` delete a model's artifacts or the whole store; `pruneNow()`
+  applies the current limits immediately instead of at the next save. All three ignore the enabled
+  flag - turning the cache off stops it writing, it does not make the hundreds of MB already
+  written someone else's problem. The scan is read-only and reads safetensors headers only.
+- **`PrefixKVStore.maxTotalBytes`** (default 4 GB, `0` for no cap) bounds the store by size, and
+  `defaultDirectory` is now public so a host can show the path.
+
+### Changed
+
+- **The snapshot limit is per model, not global.** `maxSnapshots = 6` counted every base in the
+  directory, so alternating between two models evicted each other's warm base and left both cold.
+  `PrefixKVStore.maxSnapshotsPerModel` (default 6, settable) gives each model its own budget. That
+  relaxes the old bound - N models can now keep N x 6 snapshots - which is why `maxTotalBytes`
+  ships alongside it; pruning applies the count first, then the byte ceiling, and never evicts the
+  newest snapshot (a cap below one base size would otherwise write and delete it every turn).
+  Ripple inherits both with no code change.
+- **Artifacts are attributed to a model by metadata, never by file name.** Bases already carried a
+  `model` key in their safetensors header; traces now carry one in their payload. The file name
+  flattens `/` to `--` and can leave one model id prefixing another, so it cannot be parsed back
+  reliably. Traces written before this still load, and are attributed by longest-prefix match.
+- **`saveTrace` no longer prunes snapshots.** It runs after every turn, and the per-model pass has
+  to read a header from every base; it now bounds only the traces it writes.
+
 ## [0.5.0] - 2026-08-06
 
 ### Added

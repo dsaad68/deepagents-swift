@@ -191,3 +191,248 @@ struct PrefixKVStoreTests {
         #expect(empty.trace == nil)
     }
 }
+
+/// The store's *bounds* and its inventory: which snapshots survive a prune, what the directory
+/// reports it is holding, and what removal takes away.
+///
+/// Serialized because every case here mutates process-global limits, and reset in `deinit` so a
+/// failure part-way through cannot leak a 1-snapshot budget into the rest of the suite.
+@Suite(.serialized)
+final class PrefixKVStoreBoundsTests {
+    private let directory: URL
+
+    init() {
+        directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("prefix-kv-bounds-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    }
+
+    deinit {
+        PrefixKVStore.maxSnapshotsPerModel = 6
+        PrefixKVStore.maxTotalBytes = 4 << 30
+        PrefixKVStore.isEnabledOverride = nil
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    /// A base snapshot with a valid header, padded to `bytes` so the byte-cap pass has something
+    /// real to measure. `age` orders it: larger is older.
+    @discardableResult
+    private func writeBase(
+        modelID: String, tokens: [Int], bytes: Int = 0, age: TimeInterval
+    ) throws -> URL {
+        let url = PrefixKVStore.baseURL(modelID: modelID, tokens: tokens, directory: directory)
+        let object: [String: Any] = ["__metadata__": [
+            "1.version": "2", "1.model": modelID, "1.revision": "unknown",
+            "1.tokens": tokens.map(String.init).joined(separator: ",")
+        ]]
+        let header = try JSONSerialization.data(withJSONObject: object)
+        var data = withUnsafeBytes(of: UInt64(header.count).littleEndian) { Data($0) }
+        data.append(header)
+        if bytes > data.count { data.append(Data(repeating: 0, count: bytes - data.count)) }
+        try data.write(to: url)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSinceNow: -age)], ofItemAtPath: url.path
+        )
+        return url
+    }
+
+    private func names() -> Set<String> {
+        let files = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
+        return Set(files.map(\.lastPathComponent))
+    }
+
+    // MARK: - Prune, pass 1: per-model budgets
+
+    @Test("Each model keeps its own newest snapshots")
+    func prunePerModelBudget() throws {
+        PrefixKVStore.maxSnapshotsPerModel = 2
+        PrefixKVStore.maxTotalBytes = 0 // isolate pass 1
+        var kept: Set<String> = []
+        for (index, age) in [10.0, 20, 30, 40].enumerated() {
+            let a = try writeBase(modelID: "vendor/alpha", tokens: [1, index], age: age)
+            let b = try writeBase(modelID: "vendor/beta", tokens: [2, index], age: age)
+            if index < 2 { kept.formUnion([a.lastPathComponent, b.lastPathComponent]) }
+        }
+        PrefixKVStore.pruneNow(directory: directory)
+        // Two per model, not two overall - the old global rule would have left two files total.
+        #expect(names() == kept)
+    }
+
+    @Test("A busy model cannot evict a quiet model's only snapshot")
+    func pruneBudgetsAreIndependent() throws {
+        PrefixKVStore.maxSnapshotsPerModel = 3
+        PrefixKVStore.maxTotalBytes = 0
+        for index in 0 ..< 6 { try writeBase(modelID: "vendor/busy", tokens: [1, index], age: Double(index + 1)) }
+        let quiet = try writeBase(modelID: "vendor/quiet", tokens: [9], age: 999)
+        PrefixKVStore.pruneNow(directory: directory)
+        #expect(FileManager.default.fileExists(atPath: quiet.path))
+        #expect(names().count == 4) // 3 busy + 1 quiet
+    }
+
+    @Test("Grouping reads the header, so one model id prefixing another keeps them apart")
+    func pruneGroupsByHeaderNotFilename() throws {
+        PrefixKVStore.maxSnapshotsPerModel = 1
+        PrefixKVStore.maxTotalBytes = 0
+        // `flatID` makes these near-identical file-name prefixes; only the header tells them apart.
+        let short = try writeBase(modelID: "vendor/model/8bit", tokens: [1], age: 10)
+        let long = try writeBase(modelID: "vendor/model/8bit-extra", tokens: [2], age: 20)
+        PrefixKVStore.pruneNow(directory: directory)
+        #expect(FileManager.default.fileExists(atPath: short.path))
+        #expect(FileManager.default.fileExists(atPath: long.path))
+    }
+
+    // MARK: - Prune, pass 2: the byte ceiling
+
+    @Test("The oldest snapshots go until the store fits the byte cap")
+    func pruneEvictsOldestUnderTheCap() throws {
+        PrefixKVStore.maxSnapshotsPerModel = 99 // isolate pass 2
+        let newest = try writeBase(modelID: "vendor/alpha", tokens: [1], bytes: 4000, age: 10)
+        let middle = try writeBase(modelID: "vendor/alpha", tokens: [2], bytes: 4000, age: 20)
+        let oldest = try writeBase(modelID: "vendor/alpha", tokens: [3], bytes: 4000, age: 30)
+        PrefixKVStore.maxTotalBytes = 9000 // room for two
+        PrefixKVStore.pruneNow(directory: directory)
+        #expect(FileManager.default.fileExists(atPath: newest.path))
+        #expect(FileManager.default.fileExists(atPath: middle.path))
+        #expect(!FileManager.default.fileExists(atPath: oldest.path))
+    }
+
+    @Test("The newest snapshot survives even when it alone exceeds the cap")
+    func pruneNeverEvictsTheNewest() throws {
+        PrefixKVStore.maxSnapshotsPerModel = 99
+        PrefixKVStore.maxTotalBytes = 100
+        let newest = try writeBase(modelID: "vendor/alpha", tokens: [1], bytes: 8000, age: 10)
+        let older = try writeBase(modelID: "vendor/alpha", tokens: [2], bytes: 8000, age: 20)
+
+        PrefixKVStore.pruneNow(directory: directory)
+
+        // Two snapshots, so eviction genuinely runs - and still stops before the newest. Without
+        // that floor a cap below one base size means write-then-delete on every single turn.
+        #expect(!FileManager.default.fileExists(atPath: older.path))
+        #expect(FileManager.default.fileExists(atPath: newest.path))
+    }
+
+    @Test("A lone snapshot is never evicted, whatever the cap")
+    func pruneKeepsASingleSnapshot() throws {
+        PrefixKVStore.maxSnapshotsPerModel = 99
+        PrefixKVStore.maxTotalBytes = 100
+        let only = try writeBase(modelID: "vendor/alpha", tokens: [1], bytes: 8000, age: 10)
+        PrefixKVStore.pruneNow(directory: directory)
+        #expect(FileManager.default.fileExists(atPath: only.path))
+    }
+
+    @Test("A cap of zero means unlimited")
+    func zeroCapIsUnlimited() throws {
+        PrefixKVStore.maxSnapshotsPerModel = 99
+        PrefixKVStore.maxTotalBytes = 0
+        for index in 0 ..< 4 { try writeBase(modelID: "vendor/alpha", tokens: [index], bytes: 8000, age: Double(index + 1)) }
+        PrefixKVStore.pruneNow(directory: directory)
+        #expect(names().count == 4)
+    }
+
+    @Test("Limits clamp to values that cannot disable the store")
+    func limitsClamp() {
+        PrefixKVStore.maxSnapshotsPerModel = 0
+        #expect(PrefixKVStore.maxSnapshotsPerModel == 1) // keeping nothing would re-prefill every turn
+        PrefixKVStore.maxTotalBytes = -1
+        #expect(PrefixKVStore.maxTotalBytes == 0)
+    }
+
+    // MARK: - Inventory
+
+    @Test("Inventory groups bytes by model and totals them")
+    func inventoryGroupsByModel() throws {
+        try writeBase(modelID: "vendor/alpha", tokens: [1], bytes: 5000, age: 10)
+        try writeBase(modelID: "vendor/alpha", tokens: [2], bytes: 3000, age: 20)
+        try writeBase(modelID: "vendor/beta", tokens: [3], bytes: 1000, age: 30)
+        let inventory = PrefixKVStore.inventory(directory: directory, knownModelIDs: [])
+        #expect(inventory.models.map(\.modelID) == ["vendor/alpha", "vendor/beta"]) // largest first
+        let alpha = try #require(inventory.models.first)
+        #expect(alpha.snapshotCount == 2)
+        #expect(alpha.snapshotBytes == 8000)
+        #expect(inventory.totalBytes == 9000)
+        #expect(inventory.unattributedCount == 0)
+    }
+
+    @Test("A trace is attributed by the model key its payload carries")
+    func inventoryAttributesTracesByPayload() throws {
+        PrefixKVStore.isEnabledOverride = true
+        PrefixKVStore.saveTrace(tokens: [1, 2, 3], modelID: "vendor/alpha", fingerprint: 7, directory: directory)
+        // Deliberately no known ids: attribution must come from the payload, not a name match.
+        let inventory = PrefixKVStore.inventory(directory: directory, knownModelIDs: [])
+        #expect(inventory.models.map(\.modelID) == ["vendor/alpha"])
+        #expect(inventory.models.first?.traceCount == 1)
+    }
+
+    @Test("A trace written before the model key falls back to the longest matching id")
+    func inventoryAttributesLegacyTracesByPrefix() throws {
+        // The pre-0.5.0 payload shape: version, revision, tokens - no model.
+        let payload = ["version": "2", "revision": "unknown", "tokens": "1,2,3"]
+        let data = try JSONEncoder().encode(payload)
+        try data.write(to: directory.appendingPathComponent("vendor--model--8bit-1f.json"))
+        let inventory = PrefixKVStore.inventory(
+            directory: directory, knownModelIDs: ["vendor/model", "vendor/model/8bit"]
+        )
+        // The longer id wins, so a shorter one never claims a longer sibling's files.
+        #expect(inventory.models.map(\.modelID) == ["vendor/model/8bit"])
+    }
+
+    @Test("Scanning never deletes what it cannot parse")
+    func inventoryIsReadOnly() throws {
+        let junk = directory.appendingPathComponent("not-a-real-snapshot.safetensors")
+        try Data(repeating: 7, count: 512).write(to: junk)
+        let inventory = PrefixKVStore.inventory(directory: directory, knownModelIDs: [])
+        #expect(inventory.unattributedCount == 1)
+        #expect(inventory.unattributedBytes == 512)
+        // `baseCandidates` deletes unreadable files; a scan the user is looking at must not.
+        #expect(FileManager.default.fileExists(atPath: junk.path))
+    }
+
+    // MARK: - Removal
+
+    @Test("Removing one model's cache spares every other model")
+    func removeOneModel() throws {
+        try writeBase(modelID: "vendor/alpha", tokens: [1], bytes: 2000, age: 10)
+        PrefixKVStore.isEnabledOverride = true
+        PrefixKVStore.saveTrace(tokens: [1], modelID: "vendor/alpha", fingerprint: 1, directory: directory)
+        let survivor = try writeBase(modelID: "vendor/beta", tokens: [2], bytes: 1000, age: 20)
+
+        let freed = PrefixKVStore.removeAll(modelID: "vendor/alpha", directory: directory, knownModelIDs: [])
+
+        #expect(freed > 2000) // the base plus its trace
+        #expect(FileManager.default.fileExists(atPath: survivor.path))
+        let inventory = PrefixKVStore.inventory(directory: directory, knownModelIDs: [])
+        #expect(inventory.models.map(\.modelID) == ["vendor/beta"])
+    }
+
+    @Test("Clearing the store empties it but keeps the directory")
+    func removeEverything() throws {
+        try writeBase(modelID: "vendor/alpha", tokens: [1], bytes: 2000, age: 10)
+        try writeBase(modelID: "vendor/beta", tokens: [2], bytes: 1000, age: 20)
+        let freed = PrefixKVStore.removeAll(directory: directory)
+        #expect(freed == 3000)
+        #expect(PrefixKVStore.inventory(directory: directory, knownModelIDs: []).totalBytes == 0)
+        #expect(FileManager.default.fileExists(atPath: directory.path))
+    }
+
+    @Test("Inventory and removal work while the store is switched off")
+    func reclaimingWorksWhileDisabled() throws {
+        try writeBase(modelID: "vendor/alpha", tokens: [1], bytes: 2000, age: 10)
+        PrefixKVStore.isEnabledOverride = false
+        // Turning the cache off stops it writing; it must not strand what is already on disk.
+        #expect(PrefixKVStore.inventory(directory: directory, knownModelIDs: []).totalBytes == 2000)
+        #expect(PrefixKVStore.removeAll(directory: directory) == 2000)
+    }
+
+    // MARK: - Trace back-compat
+
+    @Test("A trace without the model key still loads")
+    func legacyTraceStillLoads() throws {
+        PrefixKVStore.isEnabledOverride = true
+        let payload = ["version": "2", "revision": "unknown", "tokens": "4,5,6"]
+        let data = try JSONEncoder().encode(payload)
+        let hex = String(UInt64(bitPattern: Int64(11)), radix: 16)
+        try data.write(to: directory.appendingPathComponent("vendor--alpha-\(hex).json"))
+        // Requiring the new key would orphan every trace already on a user's disk.
+        #expect(PrefixKVStore.loadTrace(modelID: "vendor/alpha", fingerprint: 11, directory: directory) == [4, 5, 6])
+    }
+}
