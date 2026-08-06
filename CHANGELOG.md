@@ -7,6 +7,29 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-06
+
+### Added
+
+- **`ToolName`** - the single spelling rule for a tool name, applied in both directions.
+  `ToolName.normalized(_:)` maps a name to `[a-z0-9_]`; it is what publishes a tool's name to the
+  model *and* what every emitted name is put through on the way back in.
+- **`ServerScopedTool`** - a tool that names the server which contributed it (`serverName`,
+  `toolName`), plus **`toolsFromServer(_:in:)`** to attribute tools to a server. `MCPTool` conforms
+  and now exposes `serverName`/`toolName` publicly. Hosts contributing their own server-backed
+  tools should conform so approval defaults and per-server UI reach them.
+
+### Changed
+
+- **Published tool names are lowercased.** `ToolName.normalized` folds case as well as punctuation,
+  so an MCP server exposing `getWeather` now dispatches as `server__getweather`. Every built-in
+  tool name was already lowercase, so nothing there moves; a host reading `MCPTool.name` for
+  display should read `toolName` instead, which is unchanged.
+- **`mcpApprovalDefaults(servers:tools:)` only assigns a default to a `ServerScopedTool`.** It
+  previously matched on the dispatch-name prefix, so any tool whose name merely started with
+  `server__` was picked up. A host passing non-MCP tools that followed the convention by hand no
+  longer gets a default for them - they fall to the tool catalog.
+
 ### Fixed
 
 - **Tool names are normalized in both directions, so a hyphenated MCP server is reachable.** The
@@ -170,6 +193,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Added the `DeepAgentsVersion.current` constant so host front-ends (the Ripple CLI's `--version`,
   the Mispher app's About pane) can report the framework build they were compiled against.
 
+[0.5.0]: https://github.com/dsaad68/deepagents-swift/releases/tag/0.5.0
 [0.4.0]: https://github.com/dsaad68/deepagents-swift/releases/tag/0.4.0
 [0.3.0]: https://github.com/dsaad68/deepagents-swift/releases/tag/0.3.0
 [0.2.3]: https://github.com/dsaad68/deepagents-swift/releases/tag/0.2.3
