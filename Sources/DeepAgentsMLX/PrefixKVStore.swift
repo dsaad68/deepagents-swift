@@ -321,6 +321,17 @@ public enum PrefixKVStore {
 
         public var bytes: Int64 { snapshotBytes + traceBytes }
         public var id: String { modelID }
+
+        public init(
+            modelID: String, snapshotCount: Int, snapshotBytes: Int64,
+            traceCount: Int, traceBytes: Int64
+        ) {
+            self.modelID = modelID
+            self.snapshotCount = snapshotCount
+            self.snapshotBytes = snapshotBytes
+            self.traceCount = traceCount
+            self.traceBytes = traceBytes
+        }
     }
 
     /// Everything the store holds, grouped by model.
@@ -334,6 +345,15 @@ public enum PrefixKVStore {
         public let unattributedBytes: Int64
 
         public var totalBytes: Int64 { models.reduce(0) { $0 + $1.bytes } + unattributedBytes }
+
+        public init(
+            directory: URL, models: [ModelUsage], unattributedCount: Int, unattributedBytes: Int64
+        ) {
+            self.directory = directory
+            self.models = models
+            self.unattributedCount = unattributedCount
+            self.unattributedBytes = unattributedBytes
+        }
 
         public static let empty = Inventory(
             directory: PrefixKVStore.defaultDirectory, models: [],
