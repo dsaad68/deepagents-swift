@@ -195,23 +195,31 @@ struct ReactLoopTests {
         #expect(!redirect.contains("its result is "))
     }
 
-    @Test func toolNameResolutionToleratesHyphenAndCaseDrift() {
-        // Small models rewrite a namespaced name's punctuation while emitting the call
-        // (`parallel-search__web_search` → `parallel_search__web_search`). An unambiguous
-        // match still dispatches instead of failing as an unknown tool.
+    @Test func emittedToolNamesAreNormalizedToTheToolsOwnSpelling() {
+        // The name the model sends back goes through the same rule that published it, so one
+        // spelling of a tool exists from the moment the message enters the loop.
         let tools: [any AgentTool] = [EchoTool(), StubNamedTool("parallel_search__web_search")]
+        func names(_ emitted: [String]) -> [String] {
+            let calls = emitted.map { AgentToolCall(name: $0, arguments: [:]) }
+            return ReactAgent.normalizingToolCallNames(.ai("", toolCalls: calls), tools: tools)
+                .toolCalls.map(\.name)
+        }
 
-        #expect(ReactAgent.resolveTool(named: "parallel-search__web_search", in: tools)?.name
-            == "parallel_search__web_search")
-        #expect(ReactAgent.resolveTool(named: "Echo", in: tools)?.name == "echo")
-        #expect(ReactAgent.resolveTool(named: "echo", in: tools)?.name == "echo")
-        #expect(ReactAgent.resolveTool(named: "no_such_tool", in: tools) == nil)
-        // Ambiguity is not guessed at: two tools folding to the same name stay unresolved.
-        let ambiguous: [any AgentTool] = [
-            StubNamedTool("a-b__run"), StubNamedTool("a_b__run")
-        ]
-        #expect(ReactAgent.resolveTool(named: "a_b__run", in: ambiguous)?.name == "a_b__run") // exact wins
-        #expect(ReactAgent.resolveTool(named: "A_B__RUN", in: ambiguous) == nil)
+        #expect(names(["parallel-search__web_search"]) == ["parallel_search__web_search"])
+        #expect(names(["Echo"]) == ["echo"])
+        #expect(names(["echo"]) == ["echo"])
+        // A call that names nothing keeps the model's spelling, so the error quotes what it wrote.
+        #expect(names(["no_such_tool"]) == ["no_such_tool"])
+        // Every call in a round is normalized, not just the first.
+        #expect(names(["Echo", "parallel-search__web_search"]) == ["echo", "parallel_search__web_search"])
+    }
+
+    @Test func ambiguousToolNamesAreNotGuessedAt() {
+        // Two tools that normalize alike: an exact spelling still wins, and one matching neither
+        // exactly is left alone rather than resolved to either.
+        let tools: [any AgentTool] = [StubNamedTool("a-b__run"), StubNamedTool("a_b__run")]
+        #expect(ToolName.resolve("a_b__run", in: tools)?.name == "a_b__run")
+        #expect(ToolName.resolve("A_B__RUN", in: tools) == nil)
     }
 
     @Test func aToolReachedByNameDriftIsStillApprovalGated() async {

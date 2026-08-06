@@ -9,20 +9,24 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Fixed
 
-- **MCP tools from a hyphenated server were unreachable.** `MCPTool.sanitize` kept hyphens, so a
-  server named `parallel-search` exposed `parallel-search__web_search` - but models normalize a
-  hyphen out of a function name when emitting the call, and `ReactAgent`'s exact-match dispatch
-  answered "unknown tool" to the `parallel_search__web_search` that came back. Namespaced dispatch
-  names are now sanitized to `[A-Za-z0-9_]` (the server is still invoked with its original tool
-  name), and `ReactAgent` falls back to a case- and `-`/`_`-insensitive match when exactly one tool
-  fits.
-- **A tool reached by name drift skipped its approval gate.** `ReactAgent` now falls back to a
-  fuzzy match when a model misspells a tool name, but it forwarded the model's spelling into the
-  middleware chain. `HumanInTheLoopMiddleware` looks its gate up by the name on the request and
-  deny enforcement lives inside the handler that lookup guards, so a fuzzy-matched call ran an
-  "Ask" - or a "Deny" - tool with no approval at all. The resolved tool's canonical name is now
-  substituted into the call before dispatch, so the gate, the deny list and the emitted events all
-  key on the same name. The model's call id is preserved.
+- **Tool names are normalized in both directions, so a hyphenated MCP server is reachable.** The
+  naming convention was enforced on egress only: `MCPTool` sanitized the name it published and the
+  name the model sent back was compared raw. A `parallel-search` server therefore exposed
+  `parallel-search__web_search`, the model emitted `parallel_search__web_search` (models normalize
+  punctuation out of a function name), and dispatch answered "unknown tool" - the whole server was
+  unreachable. The rule now lives in one place, `ToolName.normalized`, and every name the model
+  emits goes through it as it enters the loop, renamed to the tool's own spelling. From that line
+  on exactly one spelling of a tool exists, so dispatch is an exact match again and the stored
+  message, the duplicate-round signature, the events, the middleware chain and the approval gate
+  cannot disagree about what was called. Servers are still invoked with their original tool names.
+- **An MCP tool could inherit another server's approval mode.** `mcpApprovalDefaults` and
+  `mcpToolsForDisplay` attributed a tool to a server by its dispatch-name prefix, which is
+  normalized - so `parallel-search` and `parallel_search` both yield `parallel_search__` and every
+  tool under it took whichever mode came last, letting a "Deny" server's tool run as "Approve".
+  Attribution now goes through the new `ServerScopedTool` protocol, which carries the contributing
+  server on the tool itself; `toolsFromServer(_:in:)` is the one way to ask. `MCPTool` conforms and
+  exposes `serverName`/`toolName`. `MCPTool.dispatchPrefix` remains for building a name but must
+  not be used to attribute one.
 - **The duplicate-round guard told the model a failed call had a result.** A call that errored and
   was re-issued unchanged drew "its result is in the conversation above", so the model answered
   from a result that never existed (observed: an unfetched web page summarized as fact). A repeat

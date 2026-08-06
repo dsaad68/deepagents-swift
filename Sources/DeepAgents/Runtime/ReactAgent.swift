@@ -84,8 +84,14 @@ public struct ReactAgent: Sendable {
                 )
                 let modelStarted = Date()
                 let response = try await handler(request)
-                state.messages.append(response.message)
-                await recordModelTurn(response.message, round: round, threadId: threadId, started: modelStarted)
+                // Normalize the emitted tool-call names here, at the one place the model's output
+                // enters the loop, so exactly one spelling of a tool exists from this line on -
+                // in the stored message, the duplicate-round signature, the events, the middleware
+                // chain and the approval gate alike. Anything reconciling spellings further down
+                // would be a second rule, disagreeing with this one.
+                let message = Self.normalizingToolCallNames(response.message, tools: tools)
+                state.messages.append(message)
+                await recordModelTurn(message, round: round, threadId: threadId, started: modelStarted)
 
                 for middleware in middleware.reversed() { await middleware.afterModel(&state) }
 
@@ -96,8 +102,8 @@ public struct ReactAgent: Sendable {
                 case .tools, .none: state.jumpTo = nil
                 }
 
-                let calls = response.message.toolCalls
-                let malformed = response.message.malformedToolCallBlocks
+                let calls = message.toolCalls
+                let malformed = message.malformedToolCallBlocks
                 onEvent(.roundCompleted(hadToolCalls: !calls.isEmpty || !malformed.isEmpty))
                 if calls.isEmpty, malformed.isEmpty { break agentLoop }
 
@@ -137,7 +143,7 @@ public struct ReactAgent: Sendable {
                 }
 
                 previousRoundFailed = await dispatchRound(
-                    response.message, state: &state, round: round,
+                    message, state: &state, round: round,
                     threadId: threadId, onEvent: onEvent
                 )
             }
@@ -437,22 +443,20 @@ public struct ReactAgent: Sendable {
 
     // MARK: - Tool dispatch
 
-    /// The tool a call names: exact match first, then a forgiving one that folds case and the
-    /// `-`/`_` distinction. Small models rewrite a namespaced name's punctuation while reasoning
-    /// about the right tool (`parallel-search__web_search` emitted as `parallel_search__web_search`),
-    /// and answering "unknown tool" to a call that unambiguously means one of ours wastes a round -
-    /// or, worse, sends the run down the duplicate-call path. The fallback applies only when exactly
-    /// one tool matches, so a genuine ambiguity still surfaces as an error.
-    static func resolveTool(named name: String, in tools: [any AgentTool]) -> (any AgentTool)? {
-        if let exact = tools.first(where: { $0.name == name }) { return exact }
-        let wanted = foldedToolName(name)
-        let matches = tools.filter { foldedToolName($0.name) == wanted }
-        return matches.count == 1 ? matches[0] : nil
-    }
-
-    /// A tool name reduced to what a model reliably reproduces: lowercase, hyphens as underscores.
-    private static func foldedToolName(_ name: String) -> String {
-        name.lowercased().replacingOccurrences(of: "-", with: "_")
+    /// `message` with each tool call renamed to the tool it names, under that tool's own spelling.
+    ///
+    /// This is the ingress half of ``ToolName`` - the egress half is what published the name in the
+    /// first place. A call that names nothing is left exactly as the model wrote it, so the
+    /// unknown-tool error quotes what was actually emitted.
+    static func normalizingToolCallNames(_ message: AgentMessage, tools: [any AgentTool]) -> AgentMessage {
+        guard message.toolCalls.contains(where: { call in !tools.contains { $0.name == call.name } })
+        else { return message }
+        var normalized = message
+        normalized.toolCalls = message.toolCalls.map { call in
+            guard let tool = ToolName.resolve(call.name, in: tools), tool.name != call.name else { return call }
+            return AgentToolCall(id: call.id, name: tool.name, arguments: call.arguments)
+        }
+        return normalized
     }
 
     /// Execute one tool call through the `wrapToolCall` middleware chain. Returns the
@@ -466,23 +470,16 @@ public struct ReactAgent: Sendable {
         state: AgentState,
         onEvent: @Sendable @escaping (AgentEvent) -> Void
     ) async -> (message: AgentMessage, stateUpdate: AgentStateUpdate?, failed: Bool) {
-        guard let tool = Self.resolveTool(named: call.name, in: tools) else {
+        onEvent(.toolStarted(name: call.name, input: call.describedArguments))
+
+        // A plain exact match: the loop normalized this name before the call reached here, so a
+        // miss means the model named no tool of ours, not that it spelled one differently.
+        guard let tool = tools.first(where: { $0.name == call.name }) else {
             let names = tools.map(\.name).joined(separator: ", ")
             let text = Self.errorJSON("Unknown tool '\(call.name)'. Available tools: \(names).")
             onEvent(.toolFailed(name: call.name, error: text))
             return (.tool(text, toolCallID: call.id), nil, true)
         }
-
-        // The model's spelling of the name only ever *selects* the tool; from here on the
-        // canonical `tool.name` is used. Everything downstream keys on the name in the request -
-        // `HumanInTheLoopMiddleware` looks up `interruptOn[request.call.name]`, and deny
-        // enforcement lives inside the handler that lookup gates - so passing a fuzzy-matched
-        // name straight through would miss the gate and run an "Ask" (or "Deny") tool unapproved.
-        // The call id is the model's and must survive, since the result message is paired to it.
-        let call = call.name == tool.name
-            ? call
-            : AgentToolCall(id: call.id, name: tool.name, arguments: call.arguments)
-        onEvent(.toolStarted(name: call.name, input: call.describedArguments))
 
         // Validate the call against the tool's declared schema before executing — the
         // on-device stand-in for Outlines-style schema enforcement (mlx-swift has no

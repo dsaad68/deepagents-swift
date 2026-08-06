@@ -134,15 +134,16 @@ public struct MCPMiddleware: AgentMiddleware {
 }
 
 /// Map each loaded MCP tool to its server's approval mode, to pass as
-/// `MispherDeepAgent.make(mcpApprovalDefaults:)`. Tools are namespaced `server__tool`, so each is
-/// attributed to the server whose dispatch-name prefix it carries. Shared by the app and ripple.
+/// `MispherDeepAgent.make(mcpApprovalDefaults:)`. Shared by the app and ripple.
+///
+/// Attributed via ``ServerScopedTool``; a tool that names no server gets no default and is
+/// governed by the tool catalog instead.
 public func mcpApprovalDefaults(
     servers: [MCPServerConfig], tools: [any AgentTool]
 ) -> [String: ToolApprovalMode] {
     var defaults: [String: ToolApprovalMode] = [:]
     for server in servers {
-        let prefix = MCPTool.dispatchPrefix(forServer: server.name)
-        for tool in tools where tool.name.hasPrefix(prefix) {
+        for tool in toolsFromServer(server.name, in: tools) {
             defaults[tool.name] = server.approvalMode
         }
     }
@@ -177,16 +178,18 @@ public struct MCPToolDisplay: Sendable {
     public let schema: [String: any Sendable]
 }
 
-/// The tools `tools` contributed by `serverName`, attributed by the namespaced `server__tool`
-/// dispatch prefix and projected for display. Lets a UI reflect the agent's live (warm) MCP
-/// tool set per server without re-parsing the agent's internal tool types.
+/// The tools `tools` contributed by `serverName`, attributed via ``ServerScopedTool`` and
+/// projected for display. Lets a UI reflect the agent's live (warm) MCP tool set per server
+/// without re-parsing the agent's internal tool types.
+///
+/// The unprefixed name comes off the tool rather than from trimming its dispatch name, so a tool
+/// the loader had to rename to break a collision still displays as the server named it.
 public func mcpToolsForDisplay(server serverName: String, in tools: [any AgentTool]) -> [MCPToolDisplay] {
-    let prefix = MCPTool.dispatchPrefix(forServer: serverName)
-    return tools.filter { $0.name.hasPrefix(prefix) }.map { tool in
+    toolsFromServer(serverName, in: tools).map { tool in
         let spec = tool.toolSchema()
         let schema = (spec["function"] as? [String: any Sendable])?["parameters"] as? [String: any Sendable] ?? [:]
         return MCPToolDisplay(
-            name: String(tool.name.dropFirst(prefix.count)),
+            name: tool.toolName,
             dispatchName: tool.name,
             description: tool.description,
             schema: schema
