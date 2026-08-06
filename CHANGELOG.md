@@ -7,6 +7,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-06
+
 ### Added
 
 - **The prefix KV store can be inspected and reclaimed.** `PrefixKVStore.inventory(directory:
@@ -17,6 +19,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   written someone else's problem. The scan is read-only and reads safetensors headers only.
 - **`PrefixKVStore.maxTotalBytes`** (default 4 GB, `0` for no cap) bounds the store by size, and
   `defaultDirectory` is now public so a host can show the path.
+- **`ToolName`** - the single spelling rule for a tool name, applied in both directions.
+  `ToolName.normalized(_:)` maps a name to `[a-z0-9_]`; it is what publishes a tool's name to the
+  model *and* what every emitted name is put through on the way back in.
+- **`ServerScopedTool`** - a tool that names the server which contributed it (`serverName`,
+  `toolName`), plus **`toolsFromServer(_:in:)`** to attribute tools to a server. `MCPTool` conforms
+  and now exposes `serverName`/`toolName` publicly. Hosts contributing their own server-backed
+  tools should conform so approval defaults and per-server UI reach them.
 
 ### Changed
 
@@ -33,21 +42,6 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   reliably. Traces written before this still load, and are attributed by longest-prefix match.
 - **`saveTrace` no longer prunes snapshots.** It runs after every turn, and the per-model pass has
   to read a header from every base; it now bounds only the traces it writes.
-
-## [0.5.0] - 2026-08-06
-
-### Added
-
-- **`ToolName`** - the single spelling rule for a tool name, applied in both directions.
-  `ToolName.normalized(_:)` maps a name to `[a-z0-9_]`; it is what publishes a tool's name to the
-  model *and* what every emitted name is put through on the way back in.
-- **`ServerScopedTool`** - a tool that names the server which contributed it (`serverName`,
-  `toolName`), plus **`toolsFromServer(_:in:)`** to attribute tools to a server. `MCPTool` conforms
-  and now exposes `serverName`/`toolName` publicly. Hosts contributing their own server-backed
-  tools should conform so approval defaults and per-server UI reach them.
-
-### Changed
-
 - **Published tool names are lowercased.** `ToolName.normalized` folds case as well as punctuation,
   so an MCP server exposing `getWeather` now dispatches as `server__getweather`. Every built-in
   tool name was already lowercase, so nothing there moves; a host reading `MCPTool.name` for
