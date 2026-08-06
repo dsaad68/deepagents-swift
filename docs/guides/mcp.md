@@ -142,7 +142,11 @@ let ok = await agent.run([.human("Summarize the latest news on Swift concurrency
 
 MCP tools are namespaced with their server name using double underscores: `server__tool_name`. For example, a `read_file` tool from a server named `filesystem-mcp` becomes `filesystem_mcp__read_file` in the agent's tool list. This prevents collisions when multiple servers expose tools with the same name.
 
-Both halves are sanitized to `[A-Za-z0-9_]` - any other character, hyphens included, becomes `_`. Hyphens are folded because models are trained on `[A-Za-z0-9_]` function names and normalize one away when emitting a call, which exact-match dispatch would then reject as an unknown tool. The server is still invoked with its original tool name, so only the name the model sees changes. Two servers that sanitize to the same prefix are disambiguated with a numeric suffix (`server__tool_2`), and dispatch also falls back to a case- and `-`/`_`-insensitive match when exactly one tool fits.
+Both halves go through `ToolName.normalized`, so the published name is always `[a-z0-9_]` - any other character, hyphens included, becomes `_`. The server is still invoked with its original tool name, so only the name the model sees changes.
+
+The same rule runs on the way back in: a name the model emits is normalized as the message enters the agent loop and the call is renamed to the matching tool's own spelling. That is why a model that reads `parallel_search__web_search` and emits `parallel-search__web_search` still reaches the tool, and why the approval gate sees the same name dispatch does. See [One spelling per tool](../concepts/mcp.md#one-spelling-per-tool).
+
+Two servers whose names normalize to the same prefix are disambiguated with a numeric suffix (`server__tool_2`). To find which server contributed a tool, call `toolsFromServer(_:in:)` rather than matching that prefix - see [Attributing a tool to its server](../concepts/mcp.md#attributing-a-tool-to-its-server).
 
 ---
 
