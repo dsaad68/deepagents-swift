@@ -89,7 +89,7 @@ let ok = await agent.run(
     switch event {
     case .token(let text, _):
         print(text, terminator: "")
-    case .toolStarted(let name, let input, _):
+    case .toolStarted(let name, let input, _, _):
         print("\n[tool] \(name)(\(input))")
     case .toolCompleted(let name, let result, _, _, _):
         print("[done] \(name): \(result)")

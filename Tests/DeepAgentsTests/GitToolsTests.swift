@@ -98,6 +98,27 @@ struct GitToolsTests {
         }
     }
 
+    /// `nothingToReport` carries a default, so dropping the argument at a call site would compile
+    /// and silently restore the bare "(no output)". These pin the two paths that would rot quietly.
+    @Test func anEmptyLogAndBlameSayWhatIsMissing() async throws {
+        try await withRepo { root, dir in
+            // A path git has no history for (an empty log with a zero exit; a repo with no commits
+            // at all fails inside git instead, and takes the error path).
+            try "x\n".write(to: dir.appendingPathComponent("fresh.txt"), atomically: true, encoding: .utf8)
+            let log = try await GitLogTool(root: root)
+                .execute(["path": .string("fresh.txt")], ToolContext())
+            #expect(log.content == "No commits touch \"fresh.txt\".")
+
+            // An empty tracked file blames to nothing, with a zero exit.
+            try "".write(to: dir.appendingPathComponent("empty.txt"), atomically: true, encoding: .utf8)
+            try git(["add", "."], in: dir)
+            try git(["commit", "-q", "-m", "empty"], in: dir)
+            let blame = try await GitBlameTool(root: root)
+                .execute(["path": .string("empty.txt")], ToolContext())
+            #expect(blame.content.contains("nothing to blame"))
+        }
+    }
+
     /// The branch line's ahead/behind counts are worth keeping when git prints them.
     @Test func trackingInformationSurvivesTheRewrite() {
         let clean = GitTools.describeStatus("## main...origin/main [ahead 2]")

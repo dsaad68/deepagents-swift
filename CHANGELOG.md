@@ -7,6 +7,52 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- **A round's independent tool calls run concurrently.** `AgentTool.isParallelSafe` (default
+  `false`) declares that a tool neither writes anything another call in the round could care about
+  nor needs an earlier call's result. The loop splits a round into batches: each run of consecutive
+  parallel-safe calls executes at once (at most four), everything else keeps its place in the serial
+  order and still sees everything dispatched before it. Three `read_file` calls now cost one read
+  instead of three. Declared by the read-only toolset: `ls`, `read_file`, `grep`, `glob`, `tree`,
+  `head`, `tail`, `diff`, `fetch`, every `git_*` tool, `current_datetime`, `calculator`, `mdfind`,
+  `read_clipboard`. Everything that writes keeps the default, and the round-ordering guarantee with
+  it - a round of `write_file` then `read_file` still means what it looks like it means.
+- **Tool events carry the call they belong to.** `.toolStarted`, `.toolProgress`, `.toolCompleted`
+  and `.toolFailed` gained a `callID`, and `.toolStarted` a `batchID` shared by the calls that ran
+  together (`nil` when a call ran alone). **Hosts must pair on `callID`, not on the tool name**:
+  three `read_file` calls can be open at once and their completions arrive in whatever order they
+  finish, so "the most recent unfinished step with this name" attaches results to the wrong one.
+  `batchID` is what lets a host mark a group as having run in parallel. Both are `nil` only for an
+  event no call produced - one a host synthesized, or a step rebuilt from a stored transcript -
+  where name matching remains the right fallback.
+
+### Changed
+
+- **A batch announces every call before any of them runs**, then reports each completion as it
+  lands, so a host shows the whole group running rather than entries that appear already finished.
+  Tool *results* are still appended in call order, whatever order the calls finish in; the trained
+  chat format pairs each call with its result, in order. Events a tool emits through its
+  `ToolContext` (the `task` tool's `.toolProgress`, the shell's streamed output) are stamped with
+  the call id on the way out, since a tool does not know its own call.
+- **Approval requests are serialised, not dispatch.** A gated tool still fans out;
+  `HumanInTheLoopMiddleware` presents one request at a time and raises the next when the previous
+  decision returns. The queue holds the decision only, never the execution - an approved call runs
+  while the next card is up, and a host that answers the gate itself (an allowlist, accept-all, a
+  deny rule) never delays a batch. Excluding gated tools instead would have made the feature inert:
+  every read-only tool defaults to `ask` in `MiddlewareCatalog`.
+- **Terse tool results now say what they are.** A clean `git status` returned a bare `## main` - 22
+  characters that read as a markdown heading, not an answer - and a 2.6B planner re-called it five
+  rounds running. `git_status` states the branch and whether the tree is clean, spells out the
+  two-column porcelain codes (`modified:`, `untracked:`, `added (staged):`; an unrecognized code
+  keeps its raw line), and summarises the count before the file list. `git_diff`, `git_log` and
+  `git_blame` replace `(no output)` with what the emptiness means. `calculator` echoes the
+  expression (`(12 * 8) + 3 = 99`) instead of a bare number, and `shell` reports a silent success
+  rather than `(no output)`. See the [custom tool guide](docs/guides/custom-tool.md) for the rule.
+- **The read-only `git` tools pass `--no-optional-locks`**, so `status` and `diff` no longer take
+  `.git/index.lock` to opportunistically refresh the index - the one write that would make two of
+  them in a batch collide.
+
 ## [0.5.0] - 2026-08-06
 
 ### Added

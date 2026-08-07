@@ -17,7 +17,7 @@ Related adapter pages: [Adapters overview](../adapters/index.md), [MLX](../adapt
 | `createAgent` | Factory: minimal agent; bring your own tools and middleware |
 | `createDeepAgent` | Factory: batteries-included deep agent with planning, filesystem, and subagent pillars |
 | `ReactAgent` | The ReAct loop; call `run(...)` to start, `compact(...)` to compress context |
-| `AgentEvent` | Streamed progress events: token, toolStarted, toolCompleted, completed, failed |
+| `AgentEvent` | Streamed progress events: token, toolStarted, toolCompleted, completed, failed. Tool events carry a `callID` - pair on it, not on the tool name, since a round's tools may run concurrently |
 | `AgentState` | Mutable run state threaded through middleware lifecycle hooks |
 | `AgentStateUpdate` | Incremental state mutations applied by tools |
 

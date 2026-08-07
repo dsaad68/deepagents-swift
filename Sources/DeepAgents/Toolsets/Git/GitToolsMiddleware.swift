@@ -108,11 +108,14 @@ public struct GitLogTool: AgentTool {
                 return ToolOutput("Error: \"\(path)\" is outside the working folder.")
             }
             args += ["--", url.path]
-            scope = " for \"\(path)\""
+            scope = path
         }
-        return await ToolOutput(
-            GitTools.run(root, args, nothingToReport: "No commits\(scope) in this repository yet.")
-        )
+        // A repository with no commits at all fails in git rather than returning nothing, so this
+        // covers the reachable case: a path git has no history for.
+        let nothing = scope.isEmpty
+            ? "No commits in this repository yet."
+            : "No commits touch \"\(scope)\"."
+        return await ToolOutput(GitTools.run(root, args, nothingToReport: nothing))
     }
 }
 
