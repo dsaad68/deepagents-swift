@@ -123,6 +123,8 @@ Tool **results** are appended in the order the model emitted the calls whatever 
 
 **Events** are deliberately the opposite. A batch emits `.toolStarted` for every one of its calls before any of them runs, then each `.toolCompleted` as that call lands - so a host shows the whole batch running and fills each entry in as it finishes, rather than three entries that pop in already done. That is only unambiguous because every tool event carries the `callID` of the call it belongs to; see [The `AgentEvent` stream](#the-agentevent-stream). The batch's children hand their events to the loop rather than calling `onEvent` themselves, so the handler is still invoked from one place at a time.
 
+`.toolStarted` also carries a `batchID`, shared by the calls of one batch and `nil` for a call that ran alone. Three cards that each took 0.1s look exactly like three sequential calls without it, so both hosts use it to mark the group - ripple prints `∥3` on the card, the app appends it to the step's header.
+
 Being gated does **not** keep a tool out of a batch. Every read-only tool defaults to `ask`, so excluding gated tools would exclude precisely the ones worth parallelising — and it would do so even where the host answers the gate itself (an allowlist, accept-all, a deny rule) and no human is asked anything. What is serialised is the approval *request*: `HumanInTheLoopMiddleware` presents one at a time and raises the next only when the previous decision comes back. An approved call runs while the next call's card is up. See [Human-in-the-loop](human-in-the-loop.md).
 
 ### The duplicate-round guard
@@ -165,7 +167,7 @@ The `onEvent` closure receives a stream of typed events as the run progresses. T
 | Event | When it fires |
 |---|---|
 | `.token(text, ...)` | A streamed token from the model arrives |
-| `.toolStarted(name, input, callID)` | A tool call is about to be dispatched |
+| `.toolStarted(name, input, callID, batchID)` | A tool call is about to be dispatched |
 | `.toolProgress(name, subagent, delta, callID)` | A running tool streamed output |
 | `.toolCompleted(name, result, ..., callID)` | A tool call has returned |
 | `.toolFailed(name, error, callID)` | A tool call errored |

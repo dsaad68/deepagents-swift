@@ -4,9 +4,8 @@ import Testing
 
 /// Parallel dispatch within one round: a run of consecutive ``AgentTool/isParallelSafe`` calls
 /// executes concurrently, while everything the framework already guaranteed holds unchanged -
-/// results in call order, one `.toolStarted`/`.toolCompleted` pair per call and never
-/// interleaved, later serial tools still seeing earlier ones' state, and gated calls still
-/// reaching the approval gate one at a time.
+/// results in call order, every event naming the call it belongs to, later serial tools still
+/// seeing earlier ones' state, and the user still asked about one gated call at a time.
 struct ParallelToolCallsTests {
     // MARK: - The calls actually overlap
 
@@ -164,6 +163,55 @@ struct ParallelToolCallsTests {
         #expect(lifecycle.map(\.callID) == [calls[0].id, calls[0].id])
     }
 
+    // MARK: - Batch identity, and the events a tool emits itself
+
+    @Test func oneBatchIDIsSharedByItsCallsAndAbsentFromSoloOnes() async {
+        let calls = [
+            AgentToolCall(name: "parallel_read", arguments: ["text": .string("a")]),
+            AgentToolCall(name: "parallel_read", arguments: ["text": .string("b")]),
+            AgentToolCall(name: "echo", arguments: ["text": .string("c")])
+        ]
+        let agent = createAgent(
+            model: FakeChatModel(answer: "done", toolCalls: calls),
+            tools: [ParallelProbeTool(), EchoTool()]
+        )
+
+        let (_, events) = await agent.collect([.human("go")])
+
+        let batches = events.compactMap { event -> UUID?? in
+            guard case .toolStarted(_, _, _, let batchID) = event else { return nil }
+            return .some(batchID)
+        }
+        #expect(batches.count == 3)
+        #expect(batches[0] != nil)
+        #expect(batches[0] == batches[1]) // the two that ran together share one id…
+        #expect(batches[2] == .some(nil)) // …and the one that ran alone has none
+    }
+
+    /// A tool emitting `.toolProgress` through its `ToolContext` doesn't know its call id, so the
+    /// loop stamps it. Without that a host can't route a running tool's output to the right card.
+    @Test func progressEmittedByAToolIsStampedWithItsCall() async {
+        let calls = (1 ... 2).map { index in
+            AgentToolCall(name: "chatty_read", arguments: ["text": .string("f\(index)")])
+        }
+        let agent = createAgent(
+            model: FakeChatModel(answer: "done", toolCalls: calls),
+            tools: [ChattyProbeTool()]
+        )
+
+        let (_, events) = await agent.collect([.human("go")])
+
+        let progress = events.compactMap { event -> (String, UUID?)? in
+            guard case .toolProgress(_, _, let delta, let callID) = event else { return nil }
+            return (delta, callID)
+        }
+        #expect(progress.count == 2)
+        // Each call's chunk names that call - the tool passed no id at all.
+        #expect(Set(progress.map(\.1)) == Set(calls.map { Optional($0.id) }))
+        #expect(progress.contains { $0.0 == "working on f1" && $0.1 == calls[0].id })
+        #expect(progress.contains { $0.0 == "working on f2" && $0.1 == calls[1].id })
+    }
+
     // MARK: - State visibility
 
     @Test func aLaterSerialCallStillSeesAnEarlierCallsStateUpdate() async {
@@ -256,6 +304,35 @@ struct ParallelToolCallsTests {
         #expect(await gate.peakInFlight == 3)
     }
 
+    /// The queue holds the *decision*, not the execution. If it wrapped the whole call, gating a
+    /// tool would quietly re-serialise the batch - the same mistake as excluding gated tools, one
+    /// layer down, and just as invisible.
+    @Test func theQueueDoesNotHoldTheGateWhileTheToolRuns() async {
+        let gate = ConcurrencyGate(expected: 2)
+        let calls = (1 ... 3).map { index in
+            AgentToolCall(name: "parallel_read", arguments: ["text": .string("f\(index)")])
+        }
+        let agent = createAgent(
+            model: FakeChatModel(answer: "done", toolCalls: calls),
+            tools: [ParallelProbeTool(gate: gate)],
+            middleware: [
+                HumanInTheLoopMiddleware(
+                    interruptOn: ["parallel_read": InterruptOnConfig()],
+                    approvalHandler: { _ in
+                        // A card a human takes a moment to answer, so the decisions are staggered.
+                        try? await Task.sleep(for: .milliseconds(30))
+                        return .approve
+                    }
+                )
+            ]
+        )
+
+        _ = await agent.collect([.human("go")])
+
+        // An approved call executes while the next card is still up, so two are in flight at once.
+        #expect(await gate.peakInFlight >= 2)
+    }
+
     /// A rejected call still short-circuits, and rejecting one of a batch leaves the others alone.
     @Test func rejectingOneCallOfABatchDoesNotTouchTheOthers() async {
         let calls = (1 ... 3).map { index in
@@ -301,7 +378,7 @@ private extension [AgentEvent] {
     var toolLifecycle: [(phase: String, callID: UUID?)] {
         compactMap { event -> (phase: String, callID: UUID?)? in
             switch event {
-            case .toolStarted(_, _, let id): return ("started", id)
+            case .toolStarted(_, _, let id, _): return ("started", id)
             case .toolCompleted(_, _, _, _, let id): return ("completed", id)
             case .toolFailed(_, _, let id): return ("failed", id)
             default: return nil
@@ -363,6 +440,23 @@ private struct ParallelProbeTool: AgentTool {
         if case .int(let delay)? = arguments["delay_ms"], delay > 0 {
             try? await Task.sleep(for: .milliseconds(delay))
         }
+        return ToolOutput("read: \(text)")
+    }
+}
+
+/// A parallel-safe tool that streams progress through its `ToolContext`, carrying no call id of
+/// its own - exactly what `task` and `shell` do.
+private struct ChattyProbeTool: AgentTool {
+    var name: String { "chatty_read" }
+    var description: String { "Read something, noisily (test double)." }
+    var isParallelSafe: Bool { true }
+    var parameters: [ToolParameter] {
+        [.required("text", type: .string, description: "What to read.")]
+    }
+
+    func execute(_ arguments: [String: AgentJSON], _ context: ToolContext) async throws -> ToolOutput {
+        guard case .string(let text)? = arguments["text"] else { return ToolOutput("read: <none>") }
+        context.onEvent(.toolProgress(name: name, subagent: nil, delta: "working on \(text)"))
         return ToolOutput("read: \(text)")
     }
 }

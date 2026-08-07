@@ -18,7 +18,12 @@ public enum AgentEvent: Sendable {
     case roundCompleted(hadToolCalls: Bool)
     /// A tool call is about to run; `input` is a human-readable rendering of its args.
     /// `callID` is the originating ``AgentToolCall/id`` - see the note below.
-    case toolStarted(name: String, input: String, callID: UUID? = nil)
+    ///
+    /// `batchID` is shared by the calls of one concurrent batch and `nil` for a call that ran on
+    /// its own, so a host can mark the tools that really did run at the same time. Every call in a
+    /// batch is announced before any of them starts, so a host has the whole group in hand before
+    /// the first result arrives.
+    case toolStarted(name: String, input: String, callID: UUID? = nil, batchID: UUID? = nil)
     /// A still-running tool streamed incremental output. The `task` tool emits these to stream a
     /// subagent's answer live; `subagent` names which subagent produced the chunk (nil for other
     /// tools). The first one of a run may carry an empty `delta` just to attach the subagent label.

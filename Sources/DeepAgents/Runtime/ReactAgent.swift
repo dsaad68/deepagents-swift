@@ -512,9 +512,12 @@ public struct ReactAgent: Sendable {
 
     /// The `.toolStarted` announcing a call. Separate from ``dispatchTool`` because a concurrent
     /// batch announces every call it holds *before* any of them runs - a host opens all of the
-    /// batch's cards at once, which is what actually happens.
-    private static func startEvent(_ call: AgentToolCall) -> AgentEvent {
-        .toolStarted(name: call.name, input: call.describedArguments, callID: call.id)
+    /// batch's cards at once, which is what actually happens. `batchID` is nil for a call that
+    /// runs on its own, and shared by the calls that run together.
+    private static func startEvent(_ call: AgentToolCall, batchID: UUID? = nil) -> AgentEvent {
+        .toolStarted(
+            name: call.name, input: call.describedArguments, callID: call.id, batchID: batchID
+        )
     }
 
     /// Run a batch of parallel-safe calls at once and return their outcomes **in call order**.
@@ -533,7 +536,10 @@ public struct ReactAgent: Sendable {
         state: AgentState,
         onEvent: @Sendable @escaping (AgentEvent) -> Void
     ) async -> [ToolOutcome] {
-        for call in calls { onEvent(Self.startEvent(call)) }
+        // One id for the whole batch: it is what lets a host say "these three ran together"
+        // rather than showing them as three ordinary calls that happened to be adjacent.
+        let batchID = UUID()
+        for call in calls { onEvent(Self.startEvent(call, batchID: batchID)) }
 
         let (events, sink) = AsyncStream<AgentEvent>.makeStream()
         async let dispatched: [ToolOutcome] = withTaskGroup(of: DispatchedCall.self) { group in
