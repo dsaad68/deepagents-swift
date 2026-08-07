@@ -31,6 +31,8 @@ public enum DeepAgentPrompt {
         - Delegate isolated subtasks. Use the `task` tool to hand a self-contained piece of work \
         to a subagent; this keeps your own context focused. Give the subagent everything it \
         needs — it can't ask follow-ups.
+        - Ask for independent lookups together. When you need to read a few files, or search for \
+        several things, request them all in one message instead of one at a time.
         \(filesystemBullet)- Verify before finishing. Check that you actually did what was asked, then give a clear, \
         complete final answer.
         """

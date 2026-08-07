@@ -8,17 +8,33 @@ import Testing
 /// The read-only `git` tools over a throwaway repository, plus a clean message when the
 /// folder isn't a repo.
 struct GitToolsTests {
+    struct GitSetupError: Error, CustomStringConvertible {
+        let description: String
+    }
+
+    /// Run a git command for the fixture, and **fail loudly if it didn't work**. Ignoring the exit
+    /// status let a failed `git commit` in `withRepo` surface much later as a puzzling assertion
+    /// ("your current branch 'main' does not have any commits yet") in whichever test happened to
+    /// draw the broken repo. Both pipes are drained before waiting, so a chatty git can't fill one
+    /// and deadlock the test run.
     @discardableResult
     private func git(_ arguments: [String], in dir: URL) throws -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
         process.arguments = ["-C", dir.path] + arguments
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = Pipe()
+        let output = Pipe(), errors = Pipe()
+        process.standardOutput = output
+        process.standardError = errors
         try process.run()
+        let out = output.fileHandleForReading.readDataToEndOfFile()
+        let err = errors.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
-        return String(bytes: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        guard process.terminationStatus == 0 else {
+            throw GitSetupError(description:
+                "git \(arguments.joined(separator: " ")) failed (\(process.terminationStatus)): "
+                    + (String(data: err, encoding: .utf8) ?? ""))
+        }
+        return String(data: out, encoding: .utf8) ?? ""
     }
 
     private func withRepo<T>(_ body: (WorkspaceRoot, URL) async throws -> T) async throws -> T {
@@ -29,6 +45,10 @@ struct GitToolsTests {
         try git(["init", "-q"], in: dir)
         try git(["config", "user.email", "t@e.st"], in: dir)
         try git(["config", "user.name", "Test"], in: dir)
+        // A fixture repo inherits the developer's global config, so on a machine with commit
+        // signing on every fixture commit shells out to gpg - which fails intermittently when the
+        // suite's tests commit concurrently ("gpg failed to sign the data"). Nothing here is signed.
+        try git(["config", "commit.gpgsign", "false"], in: dir)
         try "hello\n".write(to: dir.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
         try git(["add", "."], in: dir)
         try git(["commit", "-q", "-m", "initial"], in: dir)
