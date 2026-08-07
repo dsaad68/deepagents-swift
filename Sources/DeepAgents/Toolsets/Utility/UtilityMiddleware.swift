@@ -81,11 +81,14 @@ public struct CalculatorTool: AgentTool {
                 "Error: couldn't evaluate \"\(expression)\". Use only numbers and + - * / ( )."
             )
         }
+        // Echo the expression with the result. A bare "99" is an unlabeled fragment in a `tool`
+        // turn - the same shape that made small models re-call `read_clipboard` to check an answer
+        // they already had - and it leaves the model to remember which of several calls it answers.
         // Render whole numbers without a trailing ".0".
-        if value == value.rounded(), abs(value) < 1e15 {
-            return ToolOutput(String(Int64(value)))
-        }
-        return ToolOutput(String(value))
+        let rendered = value == value.rounded() && abs(value) < 1e15
+            ? String(Int64(value))
+            : String(value)
+        return ToolOutput("\(expression) = \(rendered)")
     }
 }
 

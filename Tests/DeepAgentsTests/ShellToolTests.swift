@@ -40,7 +40,15 @@ struct ShellToolTests {
 
     @Test func formatCombinesStreamsAndAnnotatesFailures() {
         #expect(ShellTool.format(.init(stdout: "hi", stderr: "", status: 0, timedOut: false), timeout: 60) == "hi")
-        #expect(ShellTool.format(.init(stdout: "", stderr: "", status: 0, timedOut: false), timeout: 60) == "(no output)")
+
+        // A silent success is the normal outcome for `mkdir`, `cp`, a passing test run - so say
+        // whether it worked. "(no output)" left the model to guess, and re-run to find out.
+        let silent = ShellTool.format(.init(stdout: "", stderr: "", status: 0, timedOut: false), timeout: 60)
+        #expect(silent == "The command finished successfully and printed no output.")
+        // A silent *failure* never reaches that sentence - the status note is appended first, and
+        // "exited with status 3" already says what happened.
+        let silentFailure = ShellTool.format(.init(stdout: "", stderr: "", status: 3, timedOut: false), timeout: 60)
+        #expect(silentFailure == "[Exited with status 3.]")
 
         let failed = ShellTool.format(.init(stdout: "out", stderr: "boom", status: 2, timedOut: false), timeout: 60)
         #expect(failed.contains("out") && failed.contains("boom") && failed.contains("status 2"))

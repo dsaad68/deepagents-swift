@@ -145,6 +145,10 @@ public struct ShellTool: AgentTool {
         } else if result.status != 0 {
             body += (body.isEmpty ? "" : "\n") + "[Exited with status \(result.status).]"
         }
-        return body.isEmpty ? "(no output)" : body
+        // Reaching here means no output, no timeout and a zero exit - a silent success, which is the
+        // normal outcome for `mkdir`, `cp`, a passing test run. "(no output)" didn't say whether it
+        // worked, leaving a model to re-run the command to find out. (A failure never lands here:
+        // the status note above is appended first, so `body` is non-empty.)
+        return body.isEmpty ? "The command finished successfully and printed no output." : body
     }
 }

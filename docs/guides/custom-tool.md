@@ -120,6 +120,25 @@ return ToolOutput(text: "Result: 42.00")
 
 The text becomes the content of the tool-result message. Keep it informative - the model reads it in the next round to decide what to do next.
 
+### Make the result say what it is
+
+The single most common cause of a small model looping is a result that doesn't read like an answer. The `tool` role already marks the turn as a result, but it says nothing about *what* the result is, and a bare fragment gets read as noise:
+
+| Bad | Why it loops | Good |
+|---|---|---|
+| `## main` | Reads like a markdown heading, not a status | `On branch main. The working tree is clean - no files added, changed, or deleted.` |
+| `99` | An unlabeled number; the model has to remember which call it answers | `(12 * 8) + 3 = 99` |
+| `(no output)` | Did it work, or do nothing? | `The command finished successfully and printed no output.` |
+| `` (empty) | Indistinguishable from a broken tool | `No matches for /foo/ under "src".` |
+
+This is not hypothetical. A 2.6B planner asked for `git_status` on a clean tree re-called it in five consecutive rounds, because 22 characters of branch line never read as "here is the status". `read_clipboard` carries a comment recording the same failure from an earlier round of this.
+
+The rules of thumb:
+
+- **Name the thing in the result**, especially when the value is a short scalar. Echo the input where it disambiguates ("`<expression>` = `<value>`").
+- **An empty result is a finding, so state it** - "no staged changes", "no matches", "the file is empty" - never an empty string or a bare `(none)`.
+- **Don't wrap large text in JSON.** Escaping turns every newline into `\n` and inflates a file read by ~6%, which makes it harder for a small model to read, not easier. Reserve structure for small values, the way `read_clipboard` returns `{"clipboard_text": …}` with a `note` when it's empty. Errors are the framework's own `{"error": …}` shape, applied for you.
+
 ---
 
 ## Worked example: expression calculator
