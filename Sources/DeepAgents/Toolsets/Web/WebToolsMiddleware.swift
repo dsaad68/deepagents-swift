@@ -39,6 +39,10 @@ public struct FetchTool: AgentTool {
         "Fetch a URL over HTTP(S) and return its contents as readable text (HTML is stripped)."
     }
 
+    /// A GET and nothing else, so several URLs in one round fetch at once. `curl` stays serial:
+    /// it can POST or DELETE, and two writes to one endpoint are exactly what ordering is for.
+    public var isParallelSafe: Bool { true }
+
     public var parameters: [ToolParameter] {
         [.required("url", type: .string, description: "The URL to fetch (http or https).")]
     }

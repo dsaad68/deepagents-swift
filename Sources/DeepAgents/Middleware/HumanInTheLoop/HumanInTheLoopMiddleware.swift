@@ -87,7 +87,50 @@ public enum ToolApprovalDecision: Sendable {
 /// Presents one request to the human and returns their decision. The UI side typically
 /// publishes the request, suspends on a continuation, and resumes it from the approve /
 /// deny buttons — the agent run waits inside this call.
+///
+/// A handler is never called again while an earlier call is still outstanding, however many tools
+/// the round is running at once — see ``ApprovalRequestQueue``. A host can hold a single pending request
+/// and suspend on one continuation.
 public typealias ToolApprovalHandler = @Sendable (ToolApprovalRequest) async -> ToolApprovalDecision
+
+/// Serializes the approval handler: one request is presented at a time, and the next is only
+/// raised once the previous decision comes back.
+///
+/// A round's parallel-safe tools run concurrently, so without this a batch of three gated reads
+/// would raise three approval cards at once - which neither host's UI can show. Note what this
+/// does *not* do: it holds the gate only for the decision, not for the tool's execution, so an
+/// approved call runs while the next call's card is up, and a host that auto-answers (ripple's
+/// accept-all, an allowlist, a deny rule) never delays the batch at all. Gating a tool therefore
+/// costs nothing when nobody is actually asked.
+///
+/// Waiters resume in arrival order. Which order concurrent calls *reach* the gate is up to the
+/// scheduler, so a batch's cards may not follow the order the model emitted the calls; each card
+/// names its own tool and arguments, and results still land in call order regardless.
+actor ApprovalRequestQueue {
+    private var busy = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    /// Present `request` to `handler`, waiting for any decision already in flight to come back.
+    func ask(
+        _ request: ToolApprovalRequest, _ handler: ToolApprovalHandler
+    ) async -> ToolApprovalDecision {
+        await acquire()
+        // The actor is reentrant, so this suspension lets another call reach `acquire` and park
+        // there - `busy` is what actually excludes it, not the actor's isolation.
+        let decision = await handler(request)
+        release()
+        return decision
+    }
+
+    private func acquire() async {
+        guard busy else { busy = true; return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    private func release() {
+        if waiters.isEmpty { busy = false } else { waiters.removeFirst().resume() }
+    }
+}
 
 /// The handler returned a decision the tool's config doesn't allow — LangChain raises
 /// `ValueError` here; we surface it as a failed tool call the model can see.
@@ -115,6 +158,9 @@ public struct HumanInTheLoopMiddleware: AgentMiddleware {
     /// Prepended to generated request descriptions — LangChain's `description_prefix`.
     let descriptionPrefix: String
     let approvalHandler: ToolApprovalHandler
+    /// Shared by every call this middleware gates, so concurrently-dispatched calls queue for the
+    /// user's attention instead of raising their cards on top of each other.
+    private let gate = ApprovalRequestQueue()
 
     init(
         interruptOn: [String: InterruptOnConfig],
@@ -167,7 +213,7 @@ public struct HumanInTheLoopMiddleware: AgentMiddleware {
             allowedDecisions: config.allowedDecisions
         )
 
-        let decision = await approvalHandler(approval)
+        let decision = await gate.ask(approval, approvalHandler)
         guard config.allowedDecisions.contains(decision.type) else {
             throw HumanInTheLoopError(
                 "Unexpected human decision \"\(decision.type.rawValue)\" for tool \"\(call.name)\": "

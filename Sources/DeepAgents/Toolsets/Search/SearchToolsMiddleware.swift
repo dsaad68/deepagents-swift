@@ -41,6 +41,8 @@ public struct GrepTool: AgentTool {
             + "Returns matching lines as `path:line: text`."
     }
 
+    public var isParallelSafe: Bool { true }
+
     public var parameters: [ToolParameter] {
         [
             .required("pattern", type: .string, description: "Regular expression to search for."),
@@ -102,6 +104,8 @@ public struct GlobTool: AgentTool {
             + "(e.g. `**/*.swift`, `src/*.json`). Returns matching paths."
     }
 
+    public var isParallelSafe: Bool { true }
+
     public var parameters: [ToolParameter] {
         [
             .required(
@@ -142,6 +146,8 @@ public struct TreeTool: AgentTool {
     public var description: String {
         "Show the folder layout under your working folder as an indented tree."
     }
+
+    public var isParallelSafe: Bool { true }
 
     public var parameters: [ToolParameter] {
         [

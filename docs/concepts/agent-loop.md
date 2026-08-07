@@ -75,7 +75,8 @@ A single run of `agent.run(...)` may span many rounds. Each round is:
 │  4. assistant turn appended to thread        │
 │  5. If no tool calls → done (final answer)  │
 │  6. duplicate-round guard check              │
-│  7. For each tool call (in parallel):        │
+│  7. For each tool call (serial, or in a      │
+│     parallel-safe batch):                    │
 │       wrapToolCall nest → execute            │
 │       onEvent(.toolStarted / .toolCompleted)│
 │  8. Tool result messages appended            │
@@ -106,6 +107,23 @@ When the model returns an assistant message containing tool calls, the loop:
 2. Calls `tool.execute(arguments, context)` on the appropriate `AgentTool`.
 3. Appends a `.tool` role message for each result.
 4. Emits `AgentEvent.toolStarted` before and `AgentEvent.toolCompleted` after each call.
+
+By default the calls in a round run **one after another**, and each one is handed the state - including the tool results - the calls before it produced. That ordering is a guarantee, not an implementation detail: a round of `write_file` then `read_file` means what it looks like it means.
+
+#### Parallel-safe calls
+
+A tool that reads and writes nothing another call in the round could care about can opt out of that ordering by declaring `isParallelSafe` (see [Tools](tools.md#parallel-safe-tools)). The loop then splits the round's calls into batches:
+
+- Each **run of consecutive parallel-safe calls** becomes one batch that executes concurrently, up to four calls at a time. Every call in a batch is handed the same state snapshot - the one taken when the batch started.
+- Every other call is a batch of one and keeps its place in the order, so a serial call still sees everything dispatched before it.
+
+Three `read_file` calls in one round therefore run at once, while `read_file`, `write_file`, `read_file` still runs in three steps.
+
+Tool **results** are appended in the order the model emitted the calls whatever order they finish in, because the trained chat format pairs each call with its result in order.
+
+**Events** are deliberately the opposite. A batch emits `.toolStarted` for every one of its calls before any of them runs, then each `.toolCompleted` as that call lands - so a host shows the whole batch running and fills each entry in as it finishes, rather than three entries that pop in already done. That is only unambiguous because every tool event carries the `callID` of the call it belongs to; see [The `AgentEvent` stream](#the-agentevent-stream). The batch's children hand their events to the loop rather than calling `onEvent` themselves, so the handler is still invoked from one place at a time.
+
+Being gated does **not** keep a tool out of a batch. Every read-only tool defaults to `ask`, so excluding gated tools would exclude precisely the ones worth parallelising — and it would do so even where the host answers the gate itself (an allowlist, accept-all, a deny rule) and no human is asked anything. What is serialised is the approval *request*: `HumanInTheLoopMiddleware` presents one at a time and raises the next only when the previous decision comes back. An approved call runs while the next call's card is up. See [Human-in-the-loop](human-in-the-loop.md).
 
 ### The duplicate-round guard
 
@@ -147,10 +165,15 @@ The `onEvent` closure receives a stream of typed events as the run progresses. T
 | Event | When it fires |
 |---|---|
 | `.token(text, ...)` | A streamed token from the model arrives |
-| `.toolStarted(name, input)` | A tool call is about to be dispatched |
-| `.toolCompleted(name, result, ...)` | A tool call has returned |
+| `.toolStarted(name, input, callID)` | A tool call is about to be dispatched |
+| `.toolProgress(name, subagent, delta, callID)` | A running tool streamed output |
+| `.toolCompleted(name, result, ..., callID)` | A tool call has returned |
+| `.toolFailed(name, error, callID)` | A tool call errored |
 | `.completed` | The run finished successfully |
 | `.failed(error)` | The run failed; error is attached |
+
+!!! warning "Pair tool events on `callID`, not on `name`"
+    A round's parallel-safe calls run at once, so three `read_file` entries can be open together and their completions arrive in whatever order they finish. Matching a completion to "the most recent unfinished entry with this name" attaches results to the wrong one. `callID` is the originating `AgentToolCall.id`; it is `nil` only for an event no call produced (one a host synthesized, or an entry rebuilt from a stored transcript), where name-matching is still the right fallback.
 
 !!! note
     The `onEvent` closure is `@Sendable` and may be called from a non-main actor context. If you're updating UI, dispatch to the main actor inside the closure.

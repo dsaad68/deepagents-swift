@@ -15,7 +15,7 @@ struct SubAgentReasoningForwardingTests {
     /// The concatenated `task` `.toolProgress` deltas the parent received.
     private func forwarded(_ events: [AgentEvent]) -> String {
         events.compactMap {
-            if case .toolProgress(let name, _, let delta) = $0, name == "task" { return delta }
+            if case .toolProgress(let name, _, let delta, _) = $0, name == "task" { return delta }
             return nil
         }.joined()
     }

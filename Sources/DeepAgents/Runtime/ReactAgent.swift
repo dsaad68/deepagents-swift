@@ -241,6 +241,11 @@ public struct ReactAgent: Sendable {
     /// full exchange; also feeds back the round's malformed blocks (if any) and surfaces
     /// todo-list updates. Returns whether every call in the round failed, which the
     /// duplicate-round guard uses to word its redirect truthfully.
+    ///
+    /// A run of consecutive parallel-safe calls (see ``AgentTool/isParallelSafe``) runs as one
+    /// concurrent batch; every other call keeps its own place in the serial order and still sees
+    /// everything dispatched before it. Whatever the batching, results are appended in the order
+    /// the model emitted the calls.
     @discardableResult
     private func dispatchRound(
         _ message: AgentMessage,
@@ -251,15 +256,24 @@ public struct ReactAgent: Sendable {
     ) async -> Bool {
         var todosTouched = false
         var failures = 0
-        for call in message.toolCalls {
-            let (result, update, failed) = await dispatchTool(
-                call, tools: tools, state: state, onEvent: onEvent
-            )
-            if failed { failures += 1 }
-            merge(update, into: &state.values)
-            if update?.values["todos"] != nil { todosTouched = true }
-            state.messages.append(result)
-            await log(result, threadId: threadId, round: round)
+        for batch in dispatchBatches(message.toolCalls) {
+            // Every call in a concurrent batch is handed the same state snapshot - the one taken
+            // before the batch ran. That is exactly what `isParallelSafe` declares: nothing in the
+            // batch needs a sibling's result.
+            let outcomes: [ToolOutcome]
+            if batch.count == 1 {
+                onEvent(Self.startEvent(batch[0]))
+                outcomes = await [dispatchTool(batch[0], tools: tools, state: state, onEvent: onEvent)]
+            } else {
+                outcomes = await dispatchConcurrently(batch, state: state, onEvent: onEvent)
+            }
+            for (result, update, failed) in outcomes {
+                if failed { failures += 1 }
+                merge(update, into: &state.values)
+                if update?.values["todos"] != nil { todosTouched = true }
+                state.messages.append(result)
+                await log(result, threadId: threadId, round: round)
+            }
         }
         if !message.malformedToolCallBlocks.isEmpty {
             await appendMalformedFeedback(
@@ -309,7 +323,7 @@ public struct ReactAgent: Sendable {
                     + "in the conversation above. Use that result, call a different tool, "
                     + "or answer the user now."
             )
-            onEvent(.toolFailed(name: call.name, error: text))
+            onEvent(.toolFailed(name: call.name, error: text, callID: call.id))
             let message = AgentMessage.tool(text, toolCallID: call.id)
             state.messages.append(message)
             await log(message, threadId: threadId, round: round)
@@ -340,6 +354,12 @@ public struct ReactAgent: Sendable {
     /// `appendDuplicateFeedback`) — this cap ends the run when the model won't move on
     /// even after being redirected to the result it already has.
     static let maxRepeatedRounds = 2
+
+    /// Most tool calls run at once in one concurrent batch. A round is usually two or three
+    /// reads, so this only bites on a model that emits a long burst - and a cap keeps that burst
+    /// from opening a dozen sockets or subprocesses at once. Calls beyond it run in the next
+    /// batch, still in call order.
+    static let maxConcurrentToolCalls = 4
 
     /// Longest tool result (in characters) fed back to the model. LFM models have a 32k
     /// context; one oversized `read_file`/`task` result can crowd out the conversation,
@@ -459,25 +479,109 @@ public struct ReactAgent: Sendable {
         return normalized
     }
 
+    /// What dispatching one call produced: the `tool`-role result message, any state update the
+    /// tool returned, and whether the call failed.
+    typealias ToolOutcome = (message: AgentMessage, stateUpdate: AgentStateUpdate?, failed: Bool)
+
+    /// The tools whose calls may fan out: those declaring ``AgentTool/isParallelSafe``.
+    ///
+    /// Being gated is deliberately *not* a disqualification. Every read-only tool defaults to
+    /// `.ask` in ``MiddlewareCatalog``, so excluding gated tools would exclude precisely the ones
+    /// worth parallelising - and it would do so even when the host answers the gate itself
+    /// (ripple's accept-all, an allowlist, a deny rule), where no human is asked anything. The
+    /// invariant that actually matters is one approval request at a time, and ``ApprovalRequestQueue``
+    /// enforces it where the asking happens rather than by serialising dispatch.
+    private var parallelSafeToolNames: Set<String> {
+        Set(tools.filter(\.isParallelSafe).map(\.name))
+    }
+
+    /// Split a round's calls into dispatch batches, preserving order: each run of consecutive
+    /// parallel-safe calls becomes one batch (at most ``maxConcurrentToolCalls`` long) that runs
+    /// concurrently, and every other call becomes a batch of one. A call naming no tool of ours
+    /// is not parallel-safe by this test, so the unknown-tool error keeps its place in the order.
+    private func dispatchBatches(_ calls: [AgentToolCall]) -> [[AgentToolCall]] {
+        let parallelSafe = parallelSafeToolNames
+        var batches: [[AgentToolCall]] = []
+        for call in calls {
+            let canJoin = parallelSafe.contains(call.name)
+                && (batches.last.map { $0.count < Self.maxConcurrentToolCalls && parallelSafe.contains($0[0].name) } ?? false)
+            if canJoin { batches[batches.count - 1].append(call) } else { batches.append([call]) }
+        }
+        return batches
+    }
+
+    /// The `.toolStarted` announcing a call. Separate from ``dispatchTool`` because a concurrent
+    /// batch announces every call it holds *before* any of them runs - a host opens all of the
+    /// batch's cards at once, which is what actually happens.
+    private static func startEvent(_ call: AgentToolCall) -> AgentEvent {
+        .toolStarted(name: call.name, input: call.describedArguments, callID: call.id)
+    }
+
+    /// Run a batch of parallel-safe calls at once and return their outcomes **in call order**.
+    ///
+    /// Results come back in the order the model emitted the calls, whatever order they finish in:
+    /// the trained chat format pairs each call with its result, in order. Events are the opposite -
+    /// they surface the moment they happen, so a batch's cards open together and each fills in as
+    /// its call lands. That is only safe because every tool event carries its `callID`; see the
+    /// pairing note on ``AgentEvent``.
+    ///
+    /// The children push their events into a stream this function drains, rather than calling
+    /// `onEvent` themselves, so the host's handler is still invoked from one place at a time
+    /// instead of from four task-group children at once.
+    private func dispatchConcurrently(
+        _ calls: [AgentToolCall],
+        state: AgentState,
+        onEvent: @Sendable @escaping (AgentEvent) -> Void
+    ) async -> [ToolOutcome] {
+        for call in calls { onEvent(Self.startEvent(call)) }
+
+        let (events, sink) = AsyncStream<AgentEvent>.makeStream()
+        async let dispatched: [ToolOutcome] = withTaskGroup(of: DispatchedCall.self) { group in
+            for (index, call) in calls.enumerated() {
+                group.addTask {
+                    let outcome = await dispatchTool(
+                        call, tools: tools, state: state, onEvent: { sink.yield($0) }
+                    )
+                    return DispatchedCall(index: index, outcome: outcome)
+                }
+            }
+            var byIndex: [Int: ToolOutcome] = [:]
+            for await done in group { byIndex[done.index] = done.outcome }
+            sink.finish()
+            return calls.indices.compactMap { byIndex[$0] }
+        }
+        for await event in events { onEvent(event) }
+        return await dispatched
+    }
+
+    /// One finished call of a concurrent batch: what it produced, and where it sat in the round so
+    /// the batch can put the results back in call order.
+    private struct DispatchedCall: Sendable {
+        let index: Int
+        let outcome: ToolOutcome
+    }
+
     /// Execute one tool call through the `wrapToolCall` middleware chain. Returns the
     /// `.tool` result message (tagged with the originating call's id), any state update the
     /// tool produced, and whether the call failed. Errors are caught and returned as text so
     /// the model can recover rather than aborting; `failed` lets the duplicate-round guard
     /// tell "you already have this result" from "this call already errored".
+    ///
+    /// The caller has already emitted this call's `.toolStarted` (see ``startEvent(_:)``); every
+    /// event from here on carries `call.id`, including the ones the tool itself emits through its
+    /// `ToolContext`.
     private func dispatchTool(
         _ call: AgentToolCall,
         tools: [any AgentTool],
         state: AgentState,
         onEvent: @Sendable @escaping (AgentEvent) -> Void
-    ) async -> (message: AgentMessage, stateUpdate: AgentStateUpdate?, failed: Bool) {
-        onEvent(.toolStarted(name: call.name, input: call.describedArguments))
-
+    ) async -> ToolOutcome {
         // A plain exact match: the loop normalized this name before the call reached here, so a
         // miss means the model named no tool of ours, not that it spelled one differently.
         guard let tool = tools.first(where: { $0.name == call.name }) else {
             let names = tools.map(\.name).joined(separator: ", ")
             let text = Self.errorJSON("Unknown tool '\(call.name)'. Available tools: \(names).")
-            onEvent(.toolFailed(name: call.name, error: text))
+            onEvent(.toolFailed(name: call.name, error: text, callID: call.id))
             return (.tool(text, toolCallID: call.id), nil, true)
         }
 
@@ -487,11 +591,11 @@ public struct ReactAgent: Sendable {
         // the arguments next round instead of the tool failing in a less legible way.
         if let violation = Self.schemaViolation(call, tool: tool) {
             let text = Self.errorJSON(violation)
-            onEvent(.toolFailed(name: call.name, error: text))
+            onEvent(.toolFailed(name: call.name, error: text, callID: call.id))
             return (.tool(text, toolCallID: call.id), nil, true)
         }
 
-        let context = ToolContext(state: state, onEvent: onEvent)
+        let context = ToolContext(state: state, onEvent: Self.stamping(call.id, onEvent))
         let captured = CapturedUpdate()
 
         let base: (ToolCallRequest) async throws -> AgentMessage = { request in
@@ -514,12 +618,31 @@ public struct ReactAgent: Sendable {
             // thumbnail / a diff card.
             let imageURL = (captured.value?.values[ScreenshotState.pendingKey] as? [URL])?.first
             let editDiff = captured.value?.values[EditDiffState.pendingKey] as? FileDiff
-            onEvent(.toolCompleted(name: call.name, result: message.text, imageURL: imageURL, editDiff: editDiff))
+            onEvent(.toolCompleted(
+                name: call.name, result: message.text, imageURL: imageURL,
+                editDiff: editDiff, callID: call.id
+            ))
             return (message, captured.value, false)
         } catch {
             let text = Self.errorJSON(Self.describe(error))
-            onEvent(.toolFailed(name: call.name, error: text))
+            onEvent(.toolFailed(name: call.name, error: text, callID: call.id))
             return (.tool(text, toolCallID: call.id), nil, true)
+        }
+    }
+
+    /// Tag the events a tool emits through its `ToolContext` with the call they belong to - the
+    /// `task` tool's `.toolProgress`, the shell's streamed output. The tool doesn't know its call
+    /// id and shouldn't have to; without the tag a host couldn't route progress to the right card
+    /// when two calls to the same tool are open at once.
+    private static func stamping(
+        _ callID: UUID, _ onEvent: @escaping @Sendable (AgentEvent) -> Void
+    ) -> @Sendable (AgentEvent) -> Void {
+        { event in
+            if case .toolProgress(let name, let subagent, let delta, nil) = event {
+                onEvent(.toolProgress(name: name, subagent: subagent, delta: delta, callID: callID))
+            } else {
+                onEvent(event)
+            }
         }
     }
 

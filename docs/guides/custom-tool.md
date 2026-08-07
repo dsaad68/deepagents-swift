@@ -15,6 +15,7 @@ public protocol AgentTool: Sendable {
     var parameters: [ToolParameter] { get }
     func execute(_ arguments: [String: AgentJSON], _ context: ToolContext) async throws -> ToolOutput
     func toolSchema() -> ToolSchema
+    var isParallelSafe: Bool { get }
 }
 ```
 
@@ -28,6 +29,8 @@ Four things to implement:
 | `execute` | The async implementation; receives parsed args and a context handle |
 
 `toolSchema()` is derived automatically for most cases - the default implementation serializes `name`, `description`, and `parameters` into the JSON Schema format the framework passes to the model. You only need to override it for unusual schema shapes.
+
+`isParallelSafe` defaults to `false`, which keeps the tool in the round's serial order. Override it to `true` only for a tool that neither writes anything nor needs to see an earlier call's result - see [Parallel-safe tools](#parallel-safe-tools) below.
 
 ---
 
@@ -208,6 +211,37 @@ func execute(_ arguments: [String: AgentJSON], _ context: ToolContext) async thr
     return ToolOutput(text: body)
 }
 ```
+
+---
+
+## Parallel-safe tools
+
+If your tool only reads - a lookup, a search, a GET - declare it parallel-safe so several calls to it in one round run at once:
+
+```swift
+struct StockQuoteTool: AgentTool {
+    var name: String { "stock_quote" }
+    var description: String { "Look up the current price of a ticker symbol." }
+    var parameters: [ToolParameter] {
+        [.required("symbol", type: .string, description: "Ticker symbol, e.g. AAPL")]
+    }
+
+    /// A quote lookup writes nothing and needs nothing from the round's other calls.
+    var isParallelSafe: Bool { true }
+
+    func execute(_ arguments: [String: AgentJSON], _ context: ToolContext) async throws -> ToolOutput {
+        // …
+    }
+}
+```
+
+Leave the default in place if any of these is true:
+
+- The tool writes - to disk, to state, to a remote service, to the clipboard.
+- The tool needs to see what an earlier call in the same round did. Calls in a concurrent batch all receive the same `context.state`, taken before the batch ran.
+- Two simultaneous invocations would contend - a lock, a working directory, a single-user device or app.
+
+You do not need to handle the approval case: a gated tool still fans out, and `HumanInTheLoopMiddleware` queues the approval requests so the user is only ever shown one at a time.
 
 ---
 

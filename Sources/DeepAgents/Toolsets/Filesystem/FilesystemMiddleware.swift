@@ -61,6 +61,8 @@ public struct ListFilesTool: AgentTool {
         "List the file paths in your working filesystem. Pass `path` to list just one folder."
     }
 
+    public var isParallelSafe: Bool { true }
+
     public var parameters: [ToolParameter] {
         [.optional("path", type: .string, description: "Folder to list. Omit for the top level.")]
     }
@@ -86,6 +88,9 @@ public struct ReadFileTool: AgentTool {
     let backend: any FilesystemBackend
     public var name: String { "read_file" }
     public var description: String { "Read the full contents of a file in your working filesystem." }
+    /// Reads nothing another call in the round writes - the round of three `read_file`s is the
+    /// case parallel dispatch exists for.
+    public var isParallelSafe: Bool { true }
 
     public var parameters: [ToolParameter] {
         [.required("file_path", type: .string, description: "Path of the file to read.")]

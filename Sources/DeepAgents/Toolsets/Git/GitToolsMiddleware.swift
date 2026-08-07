@@ -40,6 +40,9 @@ public struct GitStatusTool: AgentTool {
     let root: WorkspaceRoot
     public var name: String { "git_status" }
     public var description: String { "Show the git working-tree status (branch and changed files)." }
+    /// Every tool here only reads the repository, and `GitTools.run` passes
+    /// `--no-optional-locks`, so nothing in a round of them touches the index.
+    public var isParallelSafe: Bool { true }
 
     public func execute(_ arguments: [String: AgentJSON], _ context: ToolContext) async throws -> ToolOutput {
         await ToolOutput(GitTools.run(root, ["status", "--short", "--branch"]))
@@ -53,6 +56,8 @@ public struct GitDiffTool: AgentTool {
     public var description: String {
         "Show git changes as a diff. Set staged to see staged changes; pass path to limit to one file or folder."
     }
+
+    public var isParallelSafe: Bool { true }
 
     public var parameters: [ToolParameter] {
         [
@@ -79,6 +84,7 @@ public struct GitLogTool: AgentTool {
     let root: WorkspaceRoot
     public var name: String { "git_log" }
     public var description: String { "Show recent commits (one line each)." }
+    public var isParallelSafe: Bool { true }
 
     public var parameters: [ToolParameter] {
         [
@@ -105,6 +111,7 @@ public struct GitShowTool: AgentTool {
     let root: WorkspaceRoot
     public var name: String { "git_show" }
     public var description: String { "Show one commit: its message and the changes it made." }
+    public var isParallelSafe: Bool { true }
 
     public var parameters: [ToolParameter] {
         [.optional("ref", type: .string, description: "Commit, tag, or ref to show (default HEAD).")]
@@ -122,6 +129,7 @@ public struct GitBlameTool: AgentTool {
     let root: WorkspaceRoot
     public var name: String { "git_blame" }
     public var description: String { "Show line-by-line authorship (last commit per line) for a file." }
+    public var isParallelSafe: Bool { true }
 
     public var parameters: [ToolParameter] {
         [.required("path", type: .string, description: "File to annotate.")]
@@ -141,8 +149,13 @@ public struct GitBlameTool: AgentTool {
 enum GitTools {
     static func run(_ root: WorkspaceRoot, _ arguments: [String]) async -> String {
         do {
+            // `--no-optional-locks` keeps `status` / `diff` from taking `.git/index.lock` to
+            // opportunistically refresh the index. They are read-only either way, but the write
+            // is what would make two of them in one round collide - without it a parallel round
+            // can surface "Unable to create index.lock" instead of the status the model asked for.
             let result = try await ProcessRunner.run(
-                "/usr/bin/git", ["-C", root.rootURL.path] + arguments, cwd: root.rootURL
+                "/usr/bin/git", ["-C", root.rootURL.path, "--no-optional-locks"] + arguments,
+                cwd: root.rootURL
             )
             if result.timedOut { return "Error: git timed out." }
             if result.succeeded { return result.stdout.isEmpty ? "(no output)" : result.stdout }

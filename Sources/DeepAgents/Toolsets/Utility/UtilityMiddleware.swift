@@ -41,6 +41,8 @@ public struct CurrentDateTimeTool: AgentTool {
         "Get the current local date and time. Use this whenever the user asks about the date, the day of the week, or the time."
     }
 
+    public var isParallelSafe: Bool { true }
+
     public func execute(
         _ arguments: [String: AgentJSON], _ context: ToolContext
     ) async throws -> ToolOutput {
@@ -61,6 +63,8 @@ public struct CalculatorTool: AgentTool {
     public var description: String {
         "Evaluate a basic arithmetic expression with + - * / and parentheses, e.g. \"(12 * 8) + 3\"."
     }
+
+    public var isParallelSafe: Bool { true }
 
     public var parameters: [ToolParameter] {
         [.required("expression", type: .string, description: "The arithmetic expression to evaluate.")]

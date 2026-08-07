@@ -18,6 +18,8 @@ public protocol AgentTool: Sendable {
     ) async throws -> ToolOutput
 
     func toolSchema() -> ToolSchema
+
+    var isParallelSafe: Bool { get }
 }
 ```
 
@@ -28,6 +30,7 @@ public protocol AgentTool: Sendable {
 | `parameters` | Typed parameter list; drives JSON schema generation and model guidance |
 | `execute(_:_:)` | Called when the model invokes this tool; receives parsed arguments and context |
 | `toolSchema()` | Returns the JSON schema representation sent to the backend; derived from `parameters` by default |
+| `isParallelSafe` | Whether calls to this tool may run concurrently with the round's other parallel-safe calls; defaults to `false` |
 
 !!! tip
     Descriptions matter. The model decides whether to call a tool - and how to fill its arguments - based almost entirely on `description` and the `description` fields of each parameter. Write descriptions as you would a function docstring: state the effect, not the implementation.
@@ -111,6 +114,36 @@ ToolOutput(text: "File written successfully.", stateUpdate: nil)
 - An optional state update that the agent loop applies to `AgentState` after the tool returns.
 
 Return a clear, concise result string. The model reads this to decide its next action, so vague output ("done") is less useful than specific output ("Wrote 142 bytes to /tmp/output.txt").
+
+---
+
+## Parallel-safe tools
+
+A round's tool calls run one after another by default, and each call sees the state and results of the calls before it. A tool can opt out of that ordering:
+
+```swift
+struct ReadFileTool: AgentTool {
+    var name: String { "read_file" }
+    // …
+    var isParallelSafe: Bool { true }
+}
+```
+
+The loop then runs each **run of consecutive parallel-safe calls** as one concurrent batch (at most four at a time), so a round of three `read_file` calls costs one read instead of three. Results still come back in call order; the events show the batch running and each call finishing as it lands, which is why they carry a `callID` to pair on. See [The agent loop](agent-loop.md#parallel-safe-calls) for the batching rules.
+
+Declaring `true` asserts two things about the tool:
+
+- **It is safe to run concurrently with itself and with other tools.** Anything holding a lock, a subprocess working tree, or a device the OS serialises is a poor candidate.
+- **It does not need an earlier call's result or state update.** Every call in a batch is handed the same state snapshot, taken when the batch started - siblings are invisible to each other.
+
+Anything that writes - `write_file`, `edit_file`, `shell`, `write_clipboard`, `task` - should leave the default in place. So should a tool whose ordering relative to a writer matters, and a tool whose semantics you don't control (`MCPTool` defaults to `false` for exactly this reason).
+
+Two further rules the runtime applies for you:
+
+- A **gated** tool still fans out. Only the approval *request* is serialised - one card at a time, the next raised when the previous decision returns - so a gated tool costs nothing extra when the host answers the gate itself. (Read-only tools default to `ask`, so the opposite rule would make this feature inert.)
+- Middleware `wrapToolCall` chains do run concurrently around a batch. A middleware whose wrapper is order-sensitive should not wrap parallel-safe tools.
+
+Among the built-in toolsets, the read-only tools declare it: `ls`, `read_file`, `grep`, `glob`, `tree`, `head`, `tail`, `diff`, `fetch`, every `git_*` tool, `current_datetime`, `calculator`, `mdfind`, and `read_clipboard`.
 
 ---
 

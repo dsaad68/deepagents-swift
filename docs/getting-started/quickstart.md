@@ -89,9 +89,9 @@ let ok = await agent.run(
     switch event {
     case .token(let text, _):
         print(text, terminator: "")
-    case .toolStarted(let name, let input):
+    case .toolStarted(let name, let input, _):
         print("\n[tool] \(name)(\(input))")
-    case .toolCompleted(let name, let result, _):
+    case .toolCompleted(let name, let result, _, _, _):
         print("[done] \(name): \(result)")
     case .completed:
         print("\n[agent done]")
@@ -115,7 +115,7 @@ Each round the agent:
 
 1. Calls `session.nextTurn(messages:systemPrompt:tools:onChunk:)` with the full conversation history, yielding tokens via `onChunk` (surfaced as `.token` events).
 2. Parses tool calls from the response.
-3. If tool calls are present, dispatches each one (surfaced as `.toolStarted` / `.toolCompleted`), appends results to history, and loops.
+3. If tool calls are present, dispatches each one (surfaced as `.toolStarted` / `.toolCompleted`, paired by their `callID` since a round's tools may run in parallel), appends results to history, and loops.
 4. If no tool calls are present, the response is the final answer and the run ends with `.completed`.
 
 Middleware hooks fire around each model call (`wrapModelCall`) and each tool call (`wrapToolCall`), enabling logging, retry, approval gating, and prompt rewriting. See [Middleware](../concepts/middleware.md) for details.

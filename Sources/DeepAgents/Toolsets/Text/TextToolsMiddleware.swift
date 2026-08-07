@@ -35,6 +35,7 @@ public struct HeadTool: AgentTool {
     let root: WorkspaceRoot
     public var name: String { "head" }
     public var description: String { "Show the first lines of a text file (default 10)." }
+    public var isParallelSafe: Bool { true }
 
     public var parameters: [ToolParameter] {
         [
@@ -53,6 +54,7 @@ public struct TailTool: AgentTool {
     let root: WorkspaceRoot
     public var name: String { "tail" }
     public var description: String { "Show the last lines of a text file (default 10)." }
+    public var isParallelSafe: Bool { true }
 
     public var parameters: [ToolParameter] {
         [
@@ -71,6 +73,7 @@ public struct DiffTool: AgentTool {
     let root: WorkspaceRoot
     public var name: String { "diff" }
     public var description: String { "Compare two text files and show a unified diff." }
+    public var isParallelSafe: Bool { true }
 
     public var parameters: [ToolParameter] {
         [

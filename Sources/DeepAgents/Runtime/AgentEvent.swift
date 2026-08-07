@@ -17,18 +17,21 @@ public enum AgentEvent: Sendable {
     /// round was interim (tools are about to run); `false` means it was the final answer.
     case roundCompleted(hadToolCalls: Bool)
     /// A tool call is about to run; `input` is a human-readable rendering of its args.
-    case toolStarted(name: String, input: String)
+    /// `callID` is the originating ``AgentToolCall/id`` - see the note below.
+    case toolStarted(name: String, input: String, callID: UUID? = nil)
     /// A still-running tool streamed incremental output. The `task` tool emits these to stream a
     /// subagent's answer live; `subagent` names which subagent produced the chunk (nil for other
     /// tools). The first one of a run may carry an empty `delta` just to attach the subagent label.
-    case toolProgress(name: String, subagent: String?, delta: String)
+    case toolProgress(name: String, subagent: String?, delta: String, callID: UUID? = nil)
     /// A tool call finished; `result` is what the model sees next. `imageURL`, when present,
     /// is an image the tool produced (e.g. a screenshot) for the UI to show as a thumbnail.
     /// `editDiff`, when present, is a line diff an `edit_file` produced for the UI to render
     /// (the model still sees only the short `result` text).
-    case toolCompleted(name: String, result: String, imageURL: URL? = nil, editDiff: FileDiff? = nil)
+    case toolCompleted(
+        name: String, result: String, imageURL: URL? = nil, editDiff: FileDiff? = nil, callID: UUID? = nil
+    )
     /// A tool call failed; the model receives the error and may recover.
-    case toolFailed(name: String, error: String)
+    case toolFailed(name: String, error: String, callID: UUID? = nil)
     /// The to-do middleware updated the plan.
     case todosUpdated([TodoItem])
     /// Summarization compacted the conversation this round: the older messages were replaced by a
@@ -40,3 +43,15 @@ public enum AgentEvent: Sendable {
     /// The run failed.
     case failed(String)
 }
+
+// MARK: - Pairing tool events
+
+/// Every tool event carries the `callID` of the call it belongs to. **Pair on it, not on `name`.**
+///
+/// A round's calls used to run strictly one at a time, so "the most recent unfinished step with
+/// this name" identified a call unambiguously. Parallel dispatch ends that: three `read_file`
+/// calls can be open at once, and their completions arrive in whatever order they finish. Matching
+/// by name would attach the first result to whichever card the host happened to open last.
+///
+/// `callID` is `nil` only where no call exists to point at - an event a host synthesizes, or a
+/// step rebuilt from a persisted transcript. Fall back to name-matching there.
