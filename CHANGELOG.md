@@ -61,6 +61,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   rejects a wrong value - a wasted round otherwise. Parameters are ordered required-first, then optional
   alphabetically: JSON schema properties arrive unordered, so without a rule the signature (and the
   document text the retriever caches) would differ between runs.
+- **The filesystem and subagent guidance is gated too.** `FilesystemMiddleware` writes its section
+  through a `static func`, not the `static let` the other eleven use, so the first pass at gating
+  guidance missed it: with `filesystem` tiered auxiliary the prompt still carried "## Working files with
+  `ls` / `read_file` / `write_file` / `edit_file` / `mkdir`" and told the model to use tools it had no
+  schema for. `SubAgentMiddleware` is gated the same way. Found by a new property test that checks
+  *every* auxiliary tool rather than named phrases from the middleware that had already misbehaved.
 - **Withholding a tool's schema now withholds the prose about it too.** Every capability middleware
   appends a prompt section naming its own tools (~6 KB across 11 of them), and stripping
   `ModelRequest.tools` never touched that. With `apple_notes` tiered auxiliary the prompt still said

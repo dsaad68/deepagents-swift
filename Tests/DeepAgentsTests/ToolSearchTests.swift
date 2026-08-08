@@ -403,6 +403,161 @@ struct ToolSearchApprovalTests {
     }
 }
 
+/// Whole-output checks over a realistic agent, rather than checks on one mechanism.
+///
+/// Both bugs that escaped this suite - auxiliary tools' prose surviving in the prompt, and MCP tools
+/// rendering with no arguments - were found by using the feature, not by testing it. Each was a
+/// *class* of failure (one middleware's guidance, one kind of tool) that a targeted test could not see.
+/// These assert properties over every tool an agent actually assembles, so the next member of either
+/// class fails here instead.
+@Suite("Nothing leaks, nothing is dropped")
+struct ToolSearchWholeOutputTests {
+    /// Every catalog capability, all tiered auxiliary, plus a schema-only tool standing in for MCP.
+    private struct SchemaOnlyTool: AgentTool {
+        var name: String { "server__ask_question" }
+        var description: String { "Ask a repository a question." }
+
+        func toolSchema() -> ToolSchema {
+            [
+                "type": "function",
+                "function": [
+                    "name": name, "description": description,
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "repoName": ["type": "string", "description": "owner/repo."],
+                            "question": ["type": "string", "description": "What to ask."]
+                        ] as [String: any Sendable],
+                        "required": ["repoName", "question"]
+                    ] as [String: any Sendable]
+                ] as [String: any Sendable]
+            ]
+        }
+
+        func execute(
+            _ arguments: [String: AgentJSON], _ context: ToolContext
+        ) async throws -> ToolOutput { ToolOutput("ok") }
+    }
+
+    private func makeAgent() -> (ReactAgent, RunRecorder) {
+        let recorder = RunRecorder()
+        let root = WorkspaceRoot(rootURL: URL(fileURLWithPath: "/tmp"))
+        let middleware: [any AgentMiddleware] = [
+            WebToolsMiddleware(), SearchToolsMiddleware(root: root), TextToolsMiddleware(root: root),
+            GitToolsMiddleware(root: root), ShellToolsMiddleware(root: root),
+            ClipboardMiddleware(), AppleNotesMiddleware(), ScreenshotMiddleware(),
+            MacToolsMiddleware(root: root)
+        ]
+        // Everything the catalog knows about, tiered auxiliary, plus the MCP-shaped tool.
+        var policy = AgentToolPolicy(toolSearch: true)
+        policy.auxiliaryMiddleware = Set(MiddlewareCatalog.all.map(\.id))
+        let auxiliary = policy.expand(extraAuxiliary: ["server__ask_question"]).auxiliaryToolNames
+        let agent = createDeepAgent(
+            model: FakeChatModel(answer: "hi"),
+            tools: [SchemaOnlyTool()],
+            middleware: middleware + [RequestRecordingMiddleware(recorder: recorder)],
+            includeGeneralPurpose: false,
+            summarization: nil,
+            auxiliaryToolNames: auxiliary,
+            toolsetsByTool: ["server__ask_question": "server"]
+        )
+        return (agent, recorder)
+    }
+
+    @Test("No prompt guidance refers to an auxiliary tool")
+    func noAuxiliaryToolLeaksIntoThePrompt() async throws {
+        // The general form of the Apple Notes guidance leak. Asserting the absence of three known
+        // phrases only covered the middleware that had already misbehaved; this covers every one, and
+        // any middleware added later that forgets to gate its guidance.
+        //
+        // Matched on the **backticked** name, which is how every guidance section in this codebase
+        // refers to a tool ("call `read_note`", "## Working files with `ls` / `read_file`"). Matching a
+        // bare word would trip over tool names that are ordinary English - `open`, `say`, `head`,
+        // `diff`, `shell` - and over the index, which lists names unquoted.
+        let (agent, recorder) = makeAgent()
+        _ = await agent.run([.human("hi")]) { _ in }
+        let prompt = try #require(await recorder.systemPrompts.first.flatMap { $0 })
+        let auxiliary = Set(agent.tools.map(\.name))
+            .subtracting(agent.renderedTools.map(\.name))
+        #expect(auxiliary.count > 20) // the fixture is doing its job
+
+        for name in auxiliary.sorted() {
+            #expect(!prompt.contains("`\(name)`"), "prompt still instructs the model to use `\(name)`")
+        }
+    }
+
+    @Test("The index names every auxiliary tool exactly once")
+    func indexCoversEveryAuxiliaryTool() async throws {
+        // The other half: withholding the prose must not also withhold the tool's existence, or the
+        // agent cannot know to search for it.
+        let (agent, recorder) = makeAgent()
+        _ = await agent.run([.human("hi")]) { _ in }
+        let prompt = try #require(await recorder.systemPrompts.first.flatMap { $0 })
+        let index = try #require(prompt.components(separatedBy: "## Finding more tools").last)
+        let auxiliary = Set(agent.tools.map(\.name))
+            .subtracting(agent.renderedTools.map(\.name))
+
+        for name in auxiliary.sorted() {
+            #expect(index.contains(name), "\(name) is hidden but never listed in the index")
+        }
+    }
+
+    @Test("No tool silently loses its parameters")
+    func everyToolKeepsItsParameters() {
+        // The general form of the MCP bug: signatures were derived from a field one whole kind of tool
+        // never fills in. Compare against the rendered schema, which is what the model would have seen.
+        let (agent, _) = makeAgent()
+        for tool in agent.tools {
+            let function = tool.toolSchema()["function"] as? [String: any Sendable]
+            let parameters = function?["parameters"] as? [String: any Sendable]
+            let properties = parameters?["properties"] as? [String: any Sendable] ?? [:]
+            let specs = ToolDocument.parameterSpecs(of: tool)
+
+            let specNames = specs.map(\.name).sorted()
+            let schemaNames = properties.keys.sorted()
+            #expect(
+                specNames == schemaNames,
+                "\(tool.name): signature has \(specNames), schema has \(schemaNames)"
+            )
+            // And a tool that takes arguments must not be advertised as taking none.
+            if !properties.isEmpty {
+                #expect(!ToolDocument.signature(of: tool).hasSuffix("()"), "\(tool.name) rendered empty")
+            }
+        }
+    }
+
+    @Test("A call built from the signature alone passes schema validation")
+    func theSignatureIsEnoughToCallCorrectly() {
+        // Closes the loop the search result exists to serve: if the model passes exactly the arguments
+        // marked required, with a value from any declared enum, the call must not be bounced by
+        // `schemaViolation`. Otherwise the signature is describing something uncallable.
+        let (agent, _) = makeAgent()
+        for tool in agent.tools {
+            var arguments: [String: AgentJSON] = [:]
+            for spec in ToolDocument.parameterSpecs(of: tool) where spec.isRequired {
+                arguments[spec.name] = Self.sampleValue(for: spec)
+            }
+            let call = AgentToolCall(name: tool.name, arguments: arguments)
+            let violation = ReactAgent.schemaViolation(call, tool: tool)
+            #expect(violation == nil, "\(tool.name) rejected its own signature: \(violation ?? "")")
+        }
+    }
+
+    /// A type-appropriate value, honouring a declared enum - which is exactly what the model has to do
+    /// from the signature.
+    private static func sampleValue(for spec: ToolParameterSpec) -> AgentJSON {
+        if let allowed = spec.allowedValues.first { return .string(allowed) }
+        switch spec.type {
+        case "int": return .int(1)
+        case "number": return .double(1)
+        case "bool": return .bool(true)
+        case "object": return .object([:])
+        default:
+            return spec.type.hasPrefix("[") ? .array([.string("x")]) : .string("x")
+        }
+    }
+}
+
 @Suite("run_tool rewriting")
 struct RunToolRewriteTests {
     private let auxiliary: Set<String> = ["grep", "write_file"]
