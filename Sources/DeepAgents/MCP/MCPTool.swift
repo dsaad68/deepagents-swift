@@ -81,6 +81,49 @@ public struct MCPTool: ServerScopedTool {
     /// the original `toolName` (see `execute`), so normalizing the exposed name is safe.
     static func sanitize(_ component: String) -> String { ToolName.normalized(component) }
 
+    /// The first `required` property the call leaves out, phrased so the model can correct it, or
+    /// nil when nothing required is missing.
+    ///
+    /// Deliberately only this one check. Full JSON Schema validation here would reject calls the
+    /// server would have accepted - `anyOf`, loose types, server-side coercion - and a tool that
+    /// refuses valid work is worse than one that forwards a bad call. A named `required` property
+    /// that simply isn't there is unambiguous.
+    ///
+    /// When the call carries a near-miss of the missing name (`url` for `urls`), it is quoted back:
+    /// that is the mistake actually observed, a 2.6B reading `urls: array` as `url: string` and
+    /// then repeating it on the next URL.
+    static func missingRequiredArgument(
+        _ arguments: [String: AgentJSON], schema: Value
+    ) -> String? {
+        guard let object = schema.objectValue,
+              let required = object["required"]?.arrayValue?.compactMap(\.stringValue),
+              !required.isEmpty else { return nil }
+        let properties = object["properties"]?.objectValue ?? [:]
+        guard let missing = required.first(where: { arguments[$0] == nil }) else { return nil }
+
+        let type = properties[missing]?.objectValue?["type"]?.stringValue
+        let described = type.map { "`\(missing)` (\($0))" } ?? "`\(missing)`"
+        var complaint = "Missing required argument \(described)."
+        // Sorted, not `keys.first`: dictionary order is unstable, and a message that changes
+        // between identical runs is one a caller cannot rely on or a test pin.
+        if let nearMiss = arguments.keys.sorted().first(where: { Self.isNearMiss($0, of: missing) }) {
+            complaint += " You passed `\(nearMiss)`, which this tool does not take."
+        }
+        if type == "array" { complaint += " It takes an array, so pass a list even for a single value." }
+        return complaint + " Required: \(required.map { "`\($0)`" }.joined(separator: ", "))."
+    }
+
+    /// Whether `supplied` looks like an attempt at `expected`: one a prefix of the other (the
+    /// singular/plural slip) or the same name in a different case. Both without pulling in an
+    /// edit-distance implementation.
+    static func isNearMiss(_ supplied: String, of expected: String) -> Bool {
+        guard supplied != expected else { return false }
+        let a = supplied.lowercased(), b = expected.lowercased()
+        // Case-only differences count: `URLs` for `urls` leaves the argument genuinely missing,
+        // and it is the one mistake a caller is least likely to spot unaided.
+        return a == b || a.hasPrefix(b) || b.hasPrefix(a)
+    }
+
     /// Inject the server-provided schema directly, rather than rebuilding it from
     /// `parameters` (which an MCP tool doesn't have) — so nested objects/arrays and every
     /// constraint the server declares survive into the chat template.
@@ -98,6 +141,13 @@ public struct MCPTool: ServerScopedTool {
     public func execute(
         _ arguments: [String: AgentJSON], _ context: ToolContext
     ) async throws -> ToolOutput {
+        // Check the call against the server's own schema first. Left to the server, a mistake comes
+        // back in whatever dialect it speaks - a Pydantic dump naming `v1_extract_toolArguments`
+        // says nothing a model can act on, and a small model repeats the same call verbatim. Named
+        // in the tool's own vocabulary, it can fix it on the next round.
+        if let complaint = Self.missingRequiredArgument(arguments, schema: inputSchema) {
+            throw MCPToolError.toolFailed(name: name, message: complaint)
+        }
         let (content, isError) = try await session.callTool(
             name: toolName, arguments: MCPValueBridge.toMCPArguments(arguments)
         )
