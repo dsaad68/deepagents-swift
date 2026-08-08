@@ -146,6 +146,27 @@ public protocol ServerScopedTool: AgentTool {
 
 `MCPTool.dispatchPrefix(forServer:)` still exists for *building* or displaying a name, but must not be used to attribute one: the prefix is normalized, so distinct server names collapse onto a single prefix and the match is ambiguous. Matching on it meant a tool could take a neighbouring server's approval mode - a `.deny` server's tool running as `.approve`.
 
+## Calls are checked against the server's schema
+
+A server's `inputSchema` is injected into the model's tool list verbatim, so the model sees exactly
+what the server declares. Before a call is forwarded, DeepAgents checks one thing: that every
+property the schema lists in `required` is present. A call that leaves one out is refused locally
+with a message naming it:
+
+```
+Missing required argument `urls` (array). You passed `url`, which this tool does not take.
+It takes an array, so pass a list even for a single value. Required: `urls`.
+```
+
+Left to the server, the same mistake comes back in whatever dialect that server speaks. A Pydantic
+dump naming `v1_extract_toolArguments` tells a model nothing it can act on, and a small model
+repeats the call unchanged - observed with a 2.6B sending `url` for a `urls` array, twice in a row.
+
+**Only `required` is checked.** Types, `anyOf`, unknown extra arguments and nested requirements all
+pass through untouched, and a schema that cannot be parsed falls **open** rather than shut.
+Refusing a call the server would have accepted costs a capability with no way to override it, which
+is worse than forwarding one the server will reject.
+
 ## Per-server failure isolation
 
 If a server fails to connect or crashes mid-run, that server's tools become unavailable but all other servers continue operating normally. The failure is logged; the agent does not see an error unless it actually tries to call one of the unavailable tools.

@@ -15,7 +15,7 @@ struct SubAgentReasoningForwardingTests {
     /// The concatenated `task` `.toolProgress` deltas the parent received.
     private func forwarded(_ events: [AgentEvent]) -> String {
         events.compactMap {
-            if case .toolProgress(let name, _, let delta) = $0, name == "task" { return delta }
+            if case .toolProgress(let name, _, let delta, _) = $0, name == "task" { return delta }
             return nil
         }.joined()
     }
@@ -48,14 +48,20 @@ struct SubAgentReasoningForwardingTests {
         #expect(ThinkingSplit.split(forwarded(events)).answer == "just the answer")
     }
 
-    @Test func reasoningOnlySubagentForwardsAnUnclosedThink() async {
-        // The subagent reasons but produces no answer text → the forwarded `<think>` is never closed,
-        // which ThinkingSplit treats as in-progress reasoning.
+    @Test func aReasoningOnlySubagentStillReturnsSomething() async {
+        // A subagent runs the same loop, so it used to hand the parent an empty `task` result when
+        // it spent its turn inside `<think>` - the empty-answer bug one level down, and worse there,
+        // because the parent then reasons about a delegation that reported nothing. The loop now
+        // nudges for the answer and, when even that stays silent, salvages the thinking. The
+        // reasoning is still forwarded on its own channel for display.
         let events = await run(subagentModel: FakeChatModel(turns: [
             FakeChatModel.Turn(text: "", toolCalls: [], reasoning: "only reasoning")
         ]))
-        let split = ThinkingSplit.split(forwarded(events))
-        #expect(split.thinking == "only reasoning")
-        #expect(split.answer.isEmpty)
+        #expect(ThinkingSplit.split(forwarded(events)).thinking == "only reasoning")
+        // What the parent actually receives is no longer empty, and it is labelled as working-out
+        // so the parent doesn't reason about a monologue as though it were the subagent's finding.
+        let result = events.toolCompletedResults.first { $0.name == "task" }?.result ?? ""
+        #expect(result.contains("only reasoning"))
+        #expect(result.hasPrefix(ReactAgent.salvagedAnswerNote))
     }
 }

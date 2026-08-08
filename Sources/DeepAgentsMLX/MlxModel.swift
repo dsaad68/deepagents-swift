@@ -77,11 +77,11 @@ public struct MlxModel: Identifiable, Sendable, Hashable {
         }
         if id.contains("Qwen3.6") {
             // Qwen3.6 cards (27B / 35B-A3B): temperature 1.0 / top-p 0.95 / top-k 20; the 35B-A3B
-            // additionally recommends presence_penalty 1.5 (27B: 0.0). The cards suggest an 81920
-            // output budget for long reasoning - far past the on-device context window - so clamp
-            // `maxTokens` to the same reasoning budget the other thinking models use.
+            // additionally recommends presence_penalty 1.5 for thinking mode (27B: 0.0). The cards
+            // ask for 32,768 output tokens "for most queries", reserving 81,920 for competition
+            // math and coding - so take the everyday figure, not the extreme one.
             let presence: Float? = id.contains("35B-A3B") ? 1.5 : nil
-            return .init(maxTokens: 8192, temperature: 1.0, topP: 0.95, topK: 20, presencePenalty: presence)
+            return .init(maxTokens: 32768, temperature: 1.0, topP: 0.95, topK: 20, presencePenalty: presence)
         }
         if isGemmaFamily {
             // Gemma 4 E4B card + shipped generation_config.json: temperature 1.0 / top-p 0.95 /
@@ -90,8 +90,10 @@ public struct MlxModel: Identifiable, Sendable, Hashable {
             // budget as the other thinking models.
             return .init(maxTokens: 8192, temperature: 1.0, topP: 0.95, topK: 64)
         }
-        if id.contains("8B-A1B") {
-            return .init(maxTokens: 4096, temperature: 0.2, topK: 80, repetitionPenalty: 1.05)
+        if isEightBA1B {
+            // Reasoning-tuned: the card shows `max_new_tokens=8192`, and it emits a chain of thought
+            // before the answer - at 4096 a long reasoning pass was truncated before reaching it.
+            return .init(maxTokens: 8192, temperature: 0.2, topK: 80, repetitionPenalty: 1.05)
         }
         if isTwoPointSixB {
             // The 2.6B card asks for temperature 0.1 / top-k 50 like the other instruct models, but
@@ -123,6 +125,11 @@ public struct MlxModel: Identifiable, Sendable, Hashable {
     /// higher repetition penalty and the full 128k context window.
     private var isTwoPointSixB: Bool { id.contains("LFM2.5-2.6B") }
 
+    /// True for LFM2.5-8B-A1B - a *reasoning* model (its card documents an explicit chain of thought
+    /// before the final answer) with a 128k window, so it takes the reasoning token budget rather
+    /// than falling through to the instruct defaults.
+    private var isEightBA1B: Bool { id.contains("8B-A1B") }
+
     /// Whether the model's chat template prefills the opening `<think>` into the generation prompt,
     /// so its stream begins *inside* reasoning and only ever emits the closing tag. True for
     /// LFM2.5-2.6B, whose template ends `<|im_start|>assistant\n<think>`; every other LFM2.5
@@ -132,15 +139,21 @@ public struct MlxModel: Identifiable, Sendable, Hashable {
     /// too - so this flag only steers the LFM2 codec.)
     public var startsInReasoning: Bool { isTwoPointSixB }
 
-    /// The model's context window in tokens — what summarization's 85% trigger and the context
-    /// meter measure against. These are budgets, not capability claims, and only one row uses its
-    /// native window: LFM2.5-2.6B is run at the full 128k its card documents. The rest of the LFM2.5
-    /// family is trained for 32k and gets exactly that. The qwen3_5 family (Ornith, Qwen3.6) and
-    /// Gemma 4 are trained for far more (262k / 128k) but are deliberately clamped to 40k, because
-    /// on-device memory - not the trained window - is the real limit there.
+    /// The model's context window in tokens, exactly as its card documents it - what summarization's
+    /// trigger and the context meter measure against.
+    ///
+    /// Every row is the card's own number, so this registry can be checked against the source. It is
+    /// deliberately *not* where on-device limits are applied: a window here is what the model was
+    /// trained for, and keeping a session inside what the hardware can carry is
+    /// ``SummarizationConfig/triggerFraction``'s job, which compacts at a fraction of this and is
+    /// tunable per project. Encoding the limit as a smaller window instead made the meter and the
+    /// trigger lie about the model.
     public var contextWindowTokens: Int {
-        if isTwoPointSixB { return 131_072 }
-        return isQwenFamily || isGemmaFamily ? 40960 : 32768
+        if isTwoPointSixB { return 131_072 } // card: "Context length: 131,072 tokens"
+        if isEightBA1B { return 128_000 } // card + config.json max_position_embeddings
+        if isQwenFamily { return 262_144 } // Ornith and Qwen3.6 cards: 262,144 native
+        if isGemmaFamily { return 128_000 } // Gemma 4 E4B card: 128K (medium rows are 256K)
+        return 32768 // the rest of the LFM2.5 family is trained for 32k
     }
 
     /// Which on-device message codec drives this model in ``RebuildTurnSession`` - the LFM2 wire

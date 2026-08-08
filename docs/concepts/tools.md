@@ -18,6 +18,8 @@ public protocol AgentTool: Sendable {
     ) async throws -> ToolOutput
 
     func toolSchema() -> ToolSchema
+
+    var isParallelSafe: Bool { get }
 }
 ```
 
@@ -28,6 +30,7 @@ public protocol AgentTool: Sendable {
 | `parameters` | Typed parameter list; drives JSON schema generation and model guidance |
 | `execute(_:_:)` | Called when the model invokes this tool; receives parsed arguments and context |
 | `toolSchema()` | Returns the JSON schema representation sent to the backend; derived from `parameters` by default |
+| `isParallelSafe` | Whether calls to this tool may run concurrently with the round's other parallel-safe calls; defaults to `false` |
 
 !!! note "Names are normalized"
     A tool's `name` is put through `ToolName.normalized` in both directions: it is what the model
@@ -121,6 +124,36 @@ Return a clear, concise result string. The model reads this to decide its next a
 
 ---
 
+## Parallel-safe tools
+
+A round's tool calls run one after another by default, and each call sees the state and results of the calls before it. A tool can opt out of that ordering:
+
+```swift
+struct ReadFileTool: AgentTool {
+    var name: String { "read_file" }
+    // …
+    var isParallelSafe: Bool { true }
+}
+```
+
+The loop then runs each **run of consecutive parallel-safe calls** as one concurrent batch (at most four at a time), so a round of three `read_file` calls costs one read instead of three. Results still come back in call order; the events show the batch running and each call finishing as it lands, which is why they carry a `callID` to pair on. See [The agent loop](agent-loop.md#parallel-safe-calls) for the batching rules.
+
+Declaring `true` asserts two things about the tool:
+
+- **It is safe to run concurrently with itself and with other tools.** Anything holding a lock, a subprocess working tree, or a device the OS serialises is a poor candidate.
+- **It does not need an earlier call's result or state update.** Every call in a batch is handed the same state snapshot, taken when the batch started - siblings are invisible to each other.
+
+Anything that writes - `write_file`, `edit_file`, `shell`, `write_clipboard`, `task` - should leave the default in place. So should a tool whose ordering relative to a writer matters, and a tool whose semantics you don't control (`MCPTool` defaults to `false` for exactly this reason).
+
+Two further rules the runtime applies for you:
+
+- A **gated** tool still fans out. Only the approval *request* is serialised - one card at a time, the next raised when the previous decision returns - so a gated tool costs nothing extra when the host answers the gate itself. (Read-only tools default to `ask`, so the opposite rule would make this feature inert.)
+- Middleware `wrapToolCall` chains do run concurrently around a batch. A middleware whose wrapper is order-sensitive should not wrap parallel-safe tools.
+
+Among the built-in toolsets, the read-only tools declare it: `ls`, `read_file`, `grep`, `glob`, `tree`, `head`, `tail`, `diff`, `fetch`, every `git_*` tool, `current_datetime`, `calculator`, `mdfind`, and `read_clipboard`.
+
+---
+
 ## Generic toolsets
 
 The following toolsets ship in DeepAgents. Each toolset is owned by a middleware that contributes its tools via the `tools` property. See [Middleware](middleware.md) for the full capability catalog table and adapter requirements.
@@ -128,7 +161,7 @@ The following toolsets ship in DeepAgents. Each toolset is owned by a middleware
 | ID | Middleware | Tools |
 |---|---|---|
 | `web` | `WebToolsMiddleware` | `fetch`, `curl` |
-| `search` | `SearchToolsMiddleware` | `grep`, `glob`, `tree` |
+| `search` | `SearchToolsMiddleware` | `grep`, `glob`, `tree` (see [walk limits](#search-walk-limits)) |
 | `text` | `TextToolsMiddleware` | `head`, `tail`, `diff` |
 | `git` | `GitToolsMiddleware` | `git_status`, `git_diff`, `git_log`, `git_show`, `git_blame` |
 | `shell` | `ShellToolsMiddleware` | `shell` |
@@ -196,6 +229,36 @@ When you pass `disabledToolNames:` to `createAgent` / `createDeepAgent`, or expa
 | `ToolApprovalMode.ask` | Dispatch time (wrapToolCall) | Yes - pending user confirmation |
 
 Prefer disabling at factory time for tools that should never be available in a given context (e.g. no filesystem writes in a read-only agent). Use `ask` / `deny` approval modes for tools that should be available but audited or constrained at runtime.
+
+---
+
+## Search walk limits
+
+`grep`, `glob` and `tree` share one file walk, with two limits worth knowing about.
+
+**Build output is skipped.** `build`, `DerivedData`, `node_modules`, `Pods`, `Carthage` and
+`__pycache__` are never descended into. They are generated, routinely far larger than the source
+they came from, and never what a search is looking for - in the Mispher repo, `Ripple/build` is
+23,288 files, 96% of everything under the root. `tree` names such a folder rather than descending
+it, so the layout stays honest.
+
+The list is deliberately short and excludes names that plausibly hold real sources (`target`,
+`dist`, `site`, `vendor`). A wrongly skipped directory is a search that confidently misses
+something real - the same defect as the one below, from the other direction.
+
+**A truncated walk says so.** The walk stops after `FileWalk.maxFiles` (20,000). When it does, the
+tools report that they searched the first N files and stopped, rather than "No matches":
+
+```
+Searched the first 20000 files under "." and found no match for /pattern/, then stopped -
+the folder holds more than that, so the pattern may still be present in what was not
+searched. Narrow it with `path` or `include`.
+```
+
+This matters more than the cap itself. Reporting a truncated search as an absence gives the model a
+false fact it cannot detect, and it will act on it - in one measured case, spending 18 rounds trying
+to reconcile "no matches" with a question that presumed the symbol existed. A partial result that
+admits it is partial costs a follow-up call; a wrong one costs the whole turn.
 
 ---
 

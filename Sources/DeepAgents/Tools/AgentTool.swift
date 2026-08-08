@@ -25,10 +25,24 @@ public struct ToolContext: Sendable {
 public struct ToolOutput: Sendable {
     var content: String
     var stateUpdate: AgentStateUpdate?
+    /// Whether this result reports a failure. A tool that returns an error message rather than
+    /// throwing still failed, and a host has no way to know that from the text - so `read_file`
+    /// answering `Error: no file at "…"` used to be drawn with a success tick, telling the user
+    /// the call worked. The message reaches the model unchanged either way; this only decides how
+    /// the run reports it (`.toolFailed` rather than `.toolCompleted`).
+    var isFailure = false
 
     public init(_ content: String, stateUpdate: AgentStateUpdate? = nil) {
         self.content = content
         self.stateUpdate = stateUpdate
+    }
+
+    /// A recoverable failure. The text is returned to the model as the tool result exactly as
+    /// given, so it can correct itself; unlike throwing, nothing wraps or re-describes it.
+    public static func failure(_ content: String, stateUpdate: AgentStateUpdate? = nil) -> ToolOutput {
+        var output = ToolOutput(content, stateUpdate: stateUpdate)
+        output.isFailure = true
+        return output
     }
 }
 
@@ -41,6 +55,23 @@ public protocol AgentTool: Sendable {
     var parameters: [ToolParameter] { get }
     func execute(_ arguments: [String: AgentJSON], _ context: ToolContext) async throws -> ToolOutput
 
+    /// Whether a call to this tool may run *at the same time* as the other parallel-safe calls
+    /// the model emitted in the same round. Defaults to `false`, which is the framework's
+    /// standing guarantee: a round's tools run one after another and each one sees the state and
+    /// the tool results the calls before it produced.
+    ///
+    /// Declare `true` only when the tool both reads and writes nothing another call in the same
+    /// round could care about - `read_file`, `grep`, `git_log`, `calculator`. Two things follow
+    /// from the declaration, and a conformer is asserting both: the tool's own work is safe to
+    /// run concurrently with itself, and it does not need to see an earlier call's result or
+    /// state update (siblings in a batch all see the state as of the batch's start).
+    ///
+    /// The declaration is about the tool, not its wrapping: a gated tool never fans out however
+    /// it answers here, because an approval card is shown one at a time. Middleware
+    /// `wrapToolCall` chains do run concurrently around a parallel batch, so a middleware whose
+    /// wrapper is order-sensitive should not wrap parallel-safe tools.
+    var isParallelSafe: Bool { get }
+
     /// The `mlx-swift-lm` tool schema injected into the chat template. A protocol
     /// requirement (not just an extension method) so a conformer that already holds a
     /// server-provided JSON Schema — e.g. ``MCPTool`` — can override it to inject that
@@ -51,6 +82,11 @@ public protocol AgentTool: Sendable {
 
 extension AgentTool {
     public var parameters: [ToolParameter] { [] }
+
+    /// Serial by default - see the requirement. A tool opts into fan-out explicitly, so a tool
+    /// written before parallel dispatch existed (or an MCP server's, whose semantics we can't
+    /// know) keeps the old guarantee.
+    public var isParallelSafe: Bool { false }
 
     /// Build the `mlx-swift-lm` tool schema (`ToolSchema`) injected into the chat
     /// template — same shape as `MLXLMCommon.Tool`'s generated schema.

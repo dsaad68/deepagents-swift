@@ -57,22 +57,17 @@ public struct ReactAgent: Sendable {
             // One run-scoped, stateless model node; this loop owns the iteration and hands
             // it the full conversation each round.
             let session = model.makeSession()
+            let run = RunContext(session: session, threadId: threadId, onEvent: onEvent)
             var round = 0
-            // Duplicate-round guard: small models can re-issue the identical tool call(s)
-            // round after round (the convergence bug's signature). Track the previous
-            // round's call set; after `maxRepeatedRounds` consecutive repeats, stop
-            // dispatching and force a final answer instead of burning the iteration cap.
-            var previousSignature: [String]?
-            var previousRoundFailed = false
-            var repeatedRounds = 0
+            var repeats = RepeatGuard()
+            // Set once the loop has already nudged a silent model for its answer, so a model that
+            // only ever thinks ends the run instead of being asked again and again.
+            var nudgedForAnswer = false
 
             agentLoop: while true {
                 round += 1
                 if round > maxIterations {
-                    try await forceFinalAnswer(
-                        session: session, state: &state, round: round,
-                        threadId: threadId, onEvent: onEvent
-                    )
+                    try await forceFinalAnswer(state: &state, round: round, run: run)
                     break agentLoop
                 }
 
@@ -105,7 +100,14 @@ public struct ReactAgent: Sendable {
                 let calls = message.toolCalls
                 let malformed = message.malformedToolCallBlocks
                 onEvent(.roundCompleted(hadToolCalls: !calls.isEmpty || !malformed.isEmpty))
-                if calls.isEmpty, malformed.isEmpty { break agentLoop }
+                if calls.isEmpty, malformed.isEmpty {
+                    if !nudgedForAnswer {
+                        nudgedForAnswer = try await nudgeIfSilent(
+                            message, state: &state, round: round, run: run
+                        )
+                    }
+                    break agentLoop
+                }
 
                 // A round whose only tool calls were unparseable is not a final answer:
                 // feed the error back so the model can re-emit the call or answer in text.
@@ -114,38 +116,22 @@ public struct ReactAgent: Sendable {
                     continue agentLoop
                 }
 
-                // Duplicate-round guard: a call set identical to the previous round's
-                // can't produce new information — anything legitimately re-run (a file
-                // re-read after an edit, a fresh screenshot after a delegation) has a
-                // different call in between, so it is never consecutive-identical. The
-                // first repeat is not re-executed: the model gets a redirect to the
-                // result it already has. If it repeats again, force the final answer.
-                let signature = calls.map(\.signature).sorted()
-                if signature == previousSignature {
-                    repeatedRounds += 1
-                } else {
-                    repeatedRounds = 0
-                    previousSignature = signature
-                }
-                if repeatedRounds >= Self.maxRepeatedRounds {
-                    try await forceFinalAnswer(
-                        session: session, state: &state, round: round,
-                        threadId: threadId, onEvent: onEvent
-                    )
+                switch repeats.verdict(on: calls) {
+                case .stop:
+                    try await forceFinalAnswer(state: &state, round: round, run: run)
                     break agentLoop
-                }
-                if repeatedRounds > 0 {
+                case .redirect:
                     await appendDuplicateFeedback(
-                        RepeatedRound(calls: calls, previouslyFailed: previousRoundFailed),
+                        RepeatedRound(calls: calls, previouslyFailed: repeats.previousRoundFailed),
                         state: &state, round: round, threadId: threadId, onEvent: onEvent
                     )
                     continue agentLoop
+                case .dispatch:
+                    repeats.previousRoundFailed = await dispatchRound(
+                        message, state: &state, round: round,
+                        threadId: threadId, onEvent: onEvent
+                    )
                 }
-
-                previousRoundFailed = await dispatchRound(
-                    message, state: &state, round: round,
-                    threadId: threadId, onEvent: onEvent
-                )
             }
 
             for middleware in middleware.reversed() { await middleware.afterAgent(&state) }
@@ -196,6 +182,68 @@ public struct ReactAgent: Sendable {
         if !overhead.isEmpty { state.values[SummarizationMiddleware.promptOverheadStateKey] = overhead }
     }
 
+    /// The collaborators every step of one run shares: the model node it drives, the thread it
+    /// logs against, and where its events go. Bundled because threading the three of them through
+    /// each helper by hand is what pushed those signatures past readable.
+    private struct RunContext {
+        let session: any ModelTurnSession
+        let threadId: String?
+        let onEvent: @Sendable (AgentEvent) -> Void
+    }
+
+    /// The duplicate-round guard: small models can re-issue the identical tool call(s) round after
+    /// round (the convergence bug's signature). It tracks the previous round's call set, because a
+    /// set identical to it can't produce new information — anything legitimately re-run (a file
+    /// re-read after an edit, a fresh screenshot after a delegation) has a different call in
+    /// between, so it is never consecutive-identical.
+    private struct RepeatGuard {
+        /// Whether every call in the round just dispatched failed, which `appendDuplicateFeedback`
+        /// needs to word its redirect truthfully.
+        var previousRoundFailed = false
+        private var previousSignature: [String]?
+        private var repeats = 0
+
+        /// What to do with this round's calls: run them, redirect the model to the result it
+        /// already has (the first repeat is never re-executed), or give up on it answering by
+        /// itself after `maxRepeatedRounds` and force the final answer.
+        enum Verdict { case dispatch, redirect, stop }
+
+        mutating func verdict(on calls: [AgentToolCall]) -> Verdict {
+            let signature = calls.map(\.signature).sorted()
+            if signature == previousSignature {
+                repeats += 1
+            } else {
+                repeats = 0
+                previousSignature = signature
+            }
+            if repeats >= ReactAgent.maxRepeatedRounds { return .stop }
+            return repeats > 0 ? .redirect : .dispatch
+        }
+    }
+
+    /// A round with no tool calls ordinarily ends the run - its text is the final answer. But "no
+    /// tool calls" is not "here is the answer": a reasoning model can spend the whole turn inside
+    /// `<think>` and never reach the visible text, and taking that as the answer completes the run
+    /// with an empty reply. Observed on-device on a 2.6B: five rounds of real tool work, then 6,788
+    /// reasoning chunks, zero answer tokens, and nothing shown to the user.
+    ///
+    /// So a silent turn is nudged, once, for the answer it never wrote. Returns whether it did -
+    /// the caller keeps that, because a model that only ever thinks must end the run rather than be
+    /// asked again every round until the iteration cap.
+    private func nudgeIfSilent(
+        _ message: AgentMessage, state: inout AgentState, round: Int, run: RunContext
+    ) async throws -> Bool {
+        guard message.text.isBlank else { return false }
+        // Drop the silent turn first: an empty assistant message renders as an empty turn in the
+        // chat template, which is not a shape the model was trained on.
+        let thinking = message.reasoning
+        state.messages.removeLast()
+        try await forceFinalAnswer(
+            state: &state, round: round, run: run, fallbackReasoning: thinking
+        )
+        return true
+    }
+
     /// Run every middleware's `beforeModel` hook, then emit a `.contextCompacted` event if one of
     /// them (summarization) rewrote the history this round — it leaves the outcome in `state.values`,
     /// mirroring how a tool's `todos` update becomes `.todosUpdated`.
@@ -241,6 +289,11 @@ public struct ReactAgent: Sendable {
     /// full exchange; also feeds back the round's malformed blocks (if any) and surfaces
     /// todo-list updates. Returns whether every call in the round failed, which the
     /// duplicate-round guard uses to word its redirect truthfully.
+    ///
+    /// A run of consecutive parallel-safe calls (see ``AgentTool/isParallelSafe``) runs as one
+    /// concurrent batch; every other call keeps its own place in the serial order and still sees
+    /// everything dispatched before it. Whatever the batching, results are appended in the order
+    /// the model emitted the calls.
     @discardableResult
     private func dispatchRound(
         _ message: AgentMessage,
@@ -251,15 +304,24 @@ public struct ReactAgent: Sendable {
     ) async -> Bool {
         var todosTouched = false
         var failures = 0
-        for call in message.toolCalls {
-            let (result, update, failed) = await dispatchTool(
-                call, tools: tools, state: state, onEvent: onEvent
-            )
-            if failed { failures += 1 }
-            merge(update, into: &state.values)
-            if update?.values["todos"] != nil { todosTouched = true }
-            state.messages.append(result)
-            await log(result, threadId: threadId, round: round)
+        for batch in dispatchBatches(message.toolCalls) {
+            // Every call in a concurrent batch is handed the same state snapshot - the one taken
+            // before the batch ran. That is exactly what `isParallelSafe` declares: nothing in the
+            // batch needs a sibling's result.
+            let outcomes: [ToolOutcome]
+            if batch.count == 1 {
+                onEvent(Self.startEvent(batch[0]))
+                outcomes = await [dispatchTool(batch[0], tools: tools, state: state, onEvent: onEvent)]
+            } else {
+                outcomes = await dispatchConcurrently(batch, state: state, onEvent: onEvent)
+            }
+            for (result, update, failed) in outcomes {
+                if failed { failures += 1 }
+                merge(update, into: &state.values)
+                if update?.values["todos"] != nil { todosTouched = true }
+                state.messages.append(result)
+                await log(result, threadId: threadId, round: round)
+            }
         }
         if !message.malformedToolCallBlocks.isEmpty {
             await appendMalformedFeedback(
@@ -309,7 +371,7 @@ public struct ReactAgent: Sendable {
                     + "in the conversation above. Use that result, call a different tool, "
                     + "or answer the user now."
             )
-            onEvent(.toolFailed(name: call.name, error: text))
+            onEvent(.toolFailed(name: call.name, error: text, callID: call.id))
             let message = AgentMessage.tool(text, toolCallID: call.id)
             state.messages.append(message)
             await log(message, threadId: threadId, round: round)
@@ -341,6 +403,46 @@ public struct ReactAgent: Sendable {
     /// even after being redirected to the result it already has.
     static let maxRepeatedRounds = 2
 
+    /// Most tool calls run at once in one concurrent batch. A round is usually two or three
+    /// reads, so this only bites on a model that emits a long burst - and a cap keeps that burst
+    /// from opening a dozen sockets or subprocesses at once. Calls beyond it run in the next
+    /// batch, still in call order.
+    static let maxConcurrentToolCalls = 4
+
+    /// Prefixes an answer salvaged from the model's own reasoning, so the user is told they are
+    /// reading working-out rather than a considered reply (see ``forceFinalAnswer``).
+    static let salvagedAnswerNote =
+        "I didn't finish writing an answer. Here is what I was working through:"
+
+    /// The last resort, when the model produced neither an answer nor any reasoning to fall back
+    /// on. Names what happened and what to do about it, because a blank reply does neither.
+    static let noAnswerNote =
+        "I stopped without producing an answer. Ask me again, or rephrase the request."
+
+    /// The turn appended to the end of the conversation when the loop asks for the answer the model
+    /// never wrote. It is never stored: the user did not type it, so it must not appear in their
+    /// saved thread - only the answer it produces is kept.
+    ///
+    /// When there is reasoning to hand back, it is quoted, because the model then has to summarise
+    /// what it already worked out instead of deriving it again - and deriving it again is what
+    /// exhausted the turn in the first place.
+    static func answerRequest(reasoning: String?) -> AgentMessage {
+        guard let reasoning, !reasoning.isBlank else {
+            return .human(
+                "You stopped without writing an answer. Give me your final answer now, in plain "
+                    + "text, using the conversation above."
+            )
+        }
+        return .human("""
+        You were working on this and wrote the reasoning below, but you never wrote the answer \
+        itself:
+
+        \(reasoning)
+
+        Give me your final answer now, in plain text. Do not call any tools.
+        """)
+    }
+
     /// Longest tool result (in characters) fed back to the model. LFM models have a 32k
     /// context; one oversized `read_file`/`task` result can crowd out the conversation,
     /// so anything longer is cut with a note saying how much was dropped.
@@ -349,30 +451,62 @@ public struct ReactAgent: Sendable {
     /// One last model turn with NO tools declared (so the chat template omits the tool
     /// list entirely — the strongest "answer now" signal) plus an explicit instruction to
     /// answer in text. Used when the loop is cut short (iteration cap, duplicate-round
-    /// guard) so the user still gets an answer instead of a dangling tool result. Calls
-    /// the session directly: middleware `wrapModelCall` guidance describes tools that are
-    /// deliberately absent here. Any tool calls the model still emits are dropped.
+    /// guard, a turn that produced only reasoning) so the user still gets an answer instead
+    /// of a dangling tool result. Calls the session directly: middleware `wrapModelCall`
+    /// guidance describes tools that are deliberately absent here. Any tool calls the model
+    /// still emits are dropped.
+    ///
+    /// This is the last line of defence, so it does not hand back nothing: if even this turn
+    /// stays inside `<think>`, the run answers with the thinking - its own first, else
+    /// `fallbackReasoning` from the turn that prompted the nudge. A visible train of thought is a
+    /// poor answer, but it is an answer; a blank reply tells the user only that something broke.
     private func forceFinalAnswer(
-        session: any ModelTurnSession,
-        state: inout AgentState,
-        round: Int,
-        threadId: String?,
-        onEvent: @Sendable @escaping (AgentEvent) -> Void
+        state: inout AgentState, round: Int, run: RunContext, fallbackReasoning: String? = nil
     ) async throws {
+        let onEvent = run.onEvent
         let nudge = """
         Tool calling is now disabled. Using the conversation above, give the user your \
         final answer in plain text. Do not call any tools.
         """
         let prompt = [systemPrompt, nudge].compactMap { $0 }.joined(separator: "\n\n")
         let started = Date()
-        let message = try await session.nextTurn(
-            messages: state.messages, systemPrompt: prompt, tools: [],
+        // The ask goes at the *end* of the conversation, not only in the system prompt: the prompt
+        // sits thousands of tokens from where generation starts, and a model that has just thought
+        // itself silent is being handed the identical conversation again. A turn immediately before
+        // the generation point is the strongest position, and it can carry the model's own
+        // reasoning back so answering is a summary rather than a re-derivation.
+        //
+        // It is a `.human` turn rather than a mid-conversation `.system` one because system-role
+        // messages inside `messages` are model-gated - supported on Opus 4.8 and later, rejected
+        // with a 400 on Sonnet 5, Haiku, and older models. This path runs when a turn has already
+        // gone wrong; it must not be the thing that fails.
+        let messages = state.messages + [Self.answerRequest(reasoning: fallbackReasoning)]
+        // Start outside the reasoning channel. On a model whose template opens `<think>` for every
+        // turn, an answer only reaches `text` once the model emits `</think>` - so a turn that has
+        // already thought itself silent is being asked to answer on a channel that is not open.
+        // Closing it up front removes the requirement instead of restating it.
+        let message = try await run.session.nextTurn(
+            messages: messages, systemPrompt: prompt, tools: [],
+            startingOutsideReasoning: true,
             onChunk: Self.streamHandler(onEvent)
         )
-        let final = AgentMessage.ai(message.text)
+        var answer = message.text
+        if answer.isBlank {
+            // Say whose words these are. Unlabelled, reasoning reads as the answer - "let me try a
+            // different approach" looks like the agent is still working, when in fact it has
+            // stopped - and the user can't tell a considered reply from a salvaged monologue.
+            let thinking = [message.reasoning, fallbackReasoning].compactMap { $0 }.first { !$0.isBlank }
+            // With nothing to salvage either, the run still has to say something: a blank reply
+            // tells the user only that something broke, and not even that it was the model.
+            answer = thinking.map { Self.salvagedAnswerNote + "\n\n" + $0 } ?? Self.noAnswerNote
+            // A host builds the visible answer from `.token`, not from the stored message, so the
+            // salvaged text has to be streamed as well or the reply is blank on screen.
+            onEvent(.token(answer, isFinal: true))
+        }
+        let final = AgentMessage.ai(answer)
         state.messages.append(final)
         await messageLog?.append(
-            final, threadId: threadId,
+            final, threadId: run.threadId,
             context: AgentLogContext(
                 modelID: model.modelID, round: round,
                 generationSeconds: Date().timeIntervalSince(started)
@@ -459,25 +593,115 @@ public struct ReactAgent: Sendable {
         return normalized
     }
 
+    /// What dispatching one call produced: the `tool`-role result message, any state update the
+    /// tool returned, and whether the call failed.
+    typealias ToolOutcome = (message: AgentMessage, stateUpdate: AgentStateUpdate?, failed: Bool)
+
+    /// The tools whose calls may fan out: those declaring ``AgentTool/isParallelSafe``.
+    ///
+    /// Being gated is deliberately *not* a disqualification. Every read-only tool defaults to
+    /// `.ask` in ``MiddlewareCatalog``, so excluding gated tools would exclude precisely the ones
+    /// worth parallelising - and it would do so even when the host answers the gate itself
+    /// (ripple's accept-all, an allowlist, a deny rule), where no human is asked anything. The
+    /// invariant that actually matters is one approval request at a time, and ``ApprovalRequestQueue``
+    /// enforces it where the asking happens rather than by serialising dispatch.
+    private var parallelSafeToolNames: Set<String> {
+        Set(tools.filter(\.isParallelSafe).map(\.name))
+    }
+
+    /// Split a round's calls into dispatch batches, preserving order: each run of consecutive
+    /// parallel-safe calls becomes one batch (at most ``maxConcurrentToolCalls`` long) that runs
+    /// concurrently, and every other call becomes a batch of one. A call naming no tool of ours
+    /// is not parallel-safe by this test, so the unknown-tool error keeps its place in the order.
+    private func dispatchBatches(_ calls: [AgentToolCall]) -> [[AgentToolCall]] {
+        let parallelSafe = parallelSafeToolNames
+        var batches: [[AgentToolCall]] = []
+        for call in calls {
+            let canJoin = parallelSafe.contains(call.name)
+                && (batches.last.map { $0.count < Self.maxConcurrentToolCalls && parallelSafe.contains($0[0].name) } ?? false)
+            if canJoin { batches[batches.count - 1].append(call) } else { batches.append([call]) }
+        }
+        return batches
+    }
+
+    /// The `.toolStarted` announcing a call. Separate from ``dispatchTool`` because a concurrent
+    /// batch announces every call it holds *before* any of them runs - a host opens all of the
+    /// batch's cards at once, which is what actually happens. `batchID` is nil for a call that
+    /// runs on its own, and shared by the calls that run together.
+    private static func startEvent(_ call: AgentToolCall, batchID: UUID? = nil) -> AgentEvent {
+        .toolStarted(
+            name: call.name, input: call.describedArguments, callID: call.id, batchID: batchID
+        )
+    }
+
+    /// Run a batch of parallel-safe calls at once and return their outcomes **in call order**.
+    ///
+    /// Results come back in the order the model emitted the calls, whatever order they finish in:
+    /// the trained chat format pairs each call with its result, in order. Events are the opposite -
+    /// they surface the moment they happen, so a batch's cards open together and each fills in as
+    /// its call lands. That is only safe because every tool event carries its `callID`; see the
+    /// pairing note on ``AgentEvent``.
+    ///
+    /// The children push their events into a stream this function drains, rather than calling
+    /// `onEvent` themselves, so the host's handler is still invoked from one place at a time
+    /// instead of from four task-group children at once.
+    private func dispatchConcurrently(
+        _ calls: [AgentToolCall],
+        state: AgentState,
+        onEvent: @Sendable @escaping (AgentEvent) -> Void
+    ) async -> [ToolOutcome] {
+        // One id for the whole batch: it is what lets a host say "these three ran together"
+        // rather than showing them as three ordinary calls that happened to be adjacent.
+        let batchID = UUID()
+        for call in calls { onEvent(Self.startEvent(call, batchID: batchID)) }
+
+        let (events, sink) = AsyncStream<AgentEvent>.makeStream()
+        async let dispatched: [ToolOutcome] = withTaskGroup(of: DispatchedCall.self) { group in
+            for (index, call) in calls.enumerated() {
+                group.addTask {
+                    let outcome = await dispatchTool(
+                        call, tools: tools, state: state, onEvent: { sink.yield($0) }
+                    )
+                    return DispatchedCall(index: index, outcome: outcome)
+                }
+            }
+            var byIndex: [Int: ToolOutcome] = [:]
+            for await done in group { byIndex[done.index] = done.outcome }
+            sink.finish()
+            return calls.indices.compactMap { byIndex[$0] }
+        }
+        for await event in events { onEvent(event) }
+        return await dispatched
+    }
+
+    /// One finished call of a concurrent batch: what it produced, and where it sat in the round so
+    /// the batch can put the results back in call order.
+    private struct DispatchedCall: Sendable {
+        let index: Int
+        let outcome: ToolOutcome
+    }
+
     /// Execute one tool call through the `wrapToolCall` middleware chain. Returns the
     /// `.tool` result message (tagged with the originating call's id), any state update the
     /// tool produced, and whether the call failed. Errors are caught and returned as text so
     /// the model can recover rather than aborting; `failed` lets the duplicate-round guard
     /// tell "you already have this result" from "this call already errored".
+    ///
+    /// The caller has already emitted this call's `.toolStarted` (see ``startEvent(_:)``); every
+    /// event from here on carries `call.id`, including the ones the tool itself emits through its
+    /// `ToolContext`.
     private func dispatchTool(
         _ call: AgentToolCall,
         tools: [any AgentTool],
         state: AgentState,
         onEvent: @Sendable @escaping (AgentEvent) -> Void
-    ) async -> (message: AgentMessage, stateUpdate: AgentStateUpdate?, failed: Bool) {
-        onEvent(.toolStarted(name: call.name, input: call.describedArguments))
-
+    ) async -> ToolOutcome {
         // A plain exact match: the loop normalized this name before the call reached here, so a
         // miss means the model named no tool of ours, not that it spelled one differently.
         guard let tool = tools.first(where: { $0.name == call.name }) else {
             let names = tools.map(\.name).joined(separator: ", ")
             let text = Self.errorJSON("Unknown tool '\(call.name)'. Available tools: \(names).")
-            onEvent(.toolFailed(name: call.name, error: text))
+            onEvent(.toolFailed(name: call.name, error: text, callID: call.id))
             return (.tool(text, toolCallID: call.id), nil, true)
         }
 
@@ -487,16 +711,17 @@ public struct ReactAgent: Sendable {
         // the arguments next round instead of the tool failing in a less legible way.
         if let violation = Self.schemaViolation(call, tool: tool) {
             let text = Self.errorJSON(violation)
-            onEvent(.toolFailed(name: call.name, error: text))
+            onEvent(.toolFailed(name: call.name, error: text, callID: call.id))
             return (.tool(text, toolCallID: call.id), nil, true)
         }
 
-        let context = ToolContext(state: state, onEvent: onEvent)
+        let context = ToolContext(state: state, onEvent: Self.stamping(call.id, onEvent))
         let captured = CapturedUpdate()
 
         let base: (ToolCallRequest) async throws -> AgentMessage = { request in
             let output = try await tool.execute(request.call.arguments, context)
             captured.value = output.stateUpdate
+            captured.failed = output.isFailure
             return .tool(output.content, toolCallID: call.id)
         }
 
@@ -514,12 +739,38 @@ public struct ReactAgent: Sendable {
             // thumbnail / a diff card.
             let imageURL = (captured.value?.values[ScreenshotState.pendingKey] as? [URL])?.first
             let editDiff = captured.value?.values[EditDiffState.pendingKey] as? FileDiff
-            onEvent(.toolCompleted(name: call.name, result: message.text, imageURL: imageURL, editDiff: editDiff))
+            // A tool that reported a failure without throwing is still a failure: report it as one
+            // so the transcript doesn't tick a call that did not do what was asked, and so the
+            // duplicate-round guard counts it like any other failed call.
+            guard !captured.failed else {
+                onEvent(.toolFailed(name: call.name, error: message.text, callID: call.id))
+                return (message, captured.value, true)
+            }
+            onEvent(.toolCompleted(
+                name: call.name, result: message.text, imageURL: imageURL,
+                editDiff: editDiff, callID: call.id
+            ))
             return (message, captured.value, false)
         } catch {
             let text = Self.errorJSON(Self.describe(error))
-            onEvent(.toolFailed(name: call.name, error: text))
+            onEvent(.toolFailed(name: call.name, error: text, callID: call.id))
             return (.tool(text, toolCallID: call.id), nil, true)
+        }
+    }
+
+    /// Tag the events a tool emits through its `ToolContext` with the call they belong to - the
+    /// `task` tool's `.toolProgress`, the shell's streamed output. The tool doesn't know its call
+    /// id and shouldn't have to; without the tag a host couldn't route progress to the right card
+    /// when two calls to the same tool are open at once.
+    private static func stamping(
+        _ callID: UUID, _ onEvent: @escaping @Sendable (AgentEvent) -> Void
+    ) -> @Sendable (AgentEvent) -> Void {
+        { event in
+            if case .toolProgress(let name, let subagent, let delta, nil) = event {
+                onEvent(.toolProgress(name: name, subagent: subagent, delta: delta, callID: callID))
+            } else {
+                onEvent(event)
+            }
         }
     }
 
@@ -578,10 +829,18 @@ public struct ReactAgent: Sendable {
 /// update back out of the `wrapToolCall` chain (which only carries the `AgentMessage`).
 private final class CapturedUpdate {
     var value: AgentStateUpdate?
+    /// Set when the tool reported a failure rather than throwing - see ``ToolOutput/isFailure``.
+    var failed = false
 }
 
 private extension AgentToolCall {
     /// A deterministic identity for the duplicate-round guard: name plus the key-sorted
     /// argument rendering. Two calls with the same name and arguments compare equal.
     var signature: String { "\(name)(\(describedArguments))" }
+}
+
+private extension String {
+    /// Empty once whitespace is discounted. A model that answers with a stray newline has said
+    /// nothing, and the loop must treat it the same as saying nothing at all.
+    var isBlank: Bool { trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
 }

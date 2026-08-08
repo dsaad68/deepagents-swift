@@ -107,7 +107,7 @@ public struct ContainerShellTool: AgentTool {
     public func execute(_ arguments: [String: AgentJSON], _ context: ToolContext) async throws -> ToolOutput {
         guard let command = ToolArgs.rawString(arguments, "command"),
               !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        else { return ToolOutput("Error: `command` is required.") }
+        else { return ToolOutput.failure("Error: `command` is required.") }
 
         // Backstop: re-check at execution time, so the block also holds for a command the user edited
         // to something dangerous in the approval card.
@@ -135,7 +135,7 @@ public struct ContainerShellTool: AgentTool {
                 ))
             }
         } catch {
-            return ToolOutput("Error: \(error.localizedDescription)")
+            return ToolOutput.failure("Error: \(error.localizedDescription)")
         }
     }
 
@@ -152,7 +152,7 @@ public struct ContainerShellTool: AgentTool {
             return ToolOutput("[Sandbox unavailable - ran in the local shell instead.]\n"
                 + ShellTool.format(result, timeout: seconds))
         } catch {
-            return ToolOutput("Error: \(error.localizedDescription)")
+            return ToolOutput.failure("Error: \(error.localizedDescription)")
         }
     }
 }

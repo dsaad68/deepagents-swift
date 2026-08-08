@@ -36,6 +36,27 @@ public protocol ModelTurnSession: AnyObject {
 
 `ReactAgent` calls `makeSession()` once per `run(...)` invocation, then calls `nextTurn(...)` once per ReAct round, passing the **entire conversation** each time.
 
+The protocol has a second `nextTurn` overload taking `startingOutsideReasoning: Bool`, used for the
+forced final turn. It ships with a default implementation that ignores the flag and forwards to the
+one above, so **you only implement the four-argument version** unless your model has a reasoning
+channel that its chat template opens for you. If it does, see
+[the empty-answer note](#reasoning-models-that-never-open-the-answer-channel) below.
+
+### Reasoning models that never open the answer channel
+
+Many reasoning models have their chat template open a `<think>` block in the generation prompt, so
+generation starts *inside* reasoning and only a closing `</think>` moves output into the visible
+answer. If the model never emits that tag, the turn's `text` is empty no matter what it wrote - the
+answer had nowhere to go, and the agent sees a silent turn.
+
+`ReactAgent` handles this two ways. Its forced final turn passes `startingOutsideReasoning: true`,
+which an adapter should honour by closing the block up front so the first generated token is answer
+text (`RebuildTurnSession` appends `</think>`; a Gemma-style adapter turns its thought channel off
+instead). And if a turn still comes back silent, the run answers with the model's reasoning under a
+label rather than returning an empty string.
+
+If your model has no reasoning channel, ignore the flag - the default implementation already does.
+
 ---
 
 ## The stateless rebuild contract

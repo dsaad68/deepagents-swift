@@ -31,8 +31,15 @@ private func sampleHistory() -> [AgentMessage] {
     (0 ..< 10).map { i in i.isMultiple(of: 2) ? AgentMessage.human(body("user \(i)")) : .ai(body("assistant \(i)")) }
 }
 
+/// The default threshold is part of the contract, not an incidental constant: now that each model
+/// reports the context window its card documents - 262k on the qwen3_5 family, far past what a
+/// laptop holds - this is the only thing keeping a session inside what the hardware can carry.
+@Test func compactionTriggersAtEightyPercentByDefault() {
+    #expect(SummarizationConfig.default.triggerFraction == 0.80)
+}
+
 @Test func belowThresholdDoesNotCompact() async {
-    // Default 32k window, a tiny history: nowhere near 85%, so an automatic pass is a no-op.
+    // Default 32k window, a tiny history: nowhere near the threshold, so an automatic pass is a no-op.
     let middleware = SummarizationMiddleware(model: FakeChatModel(answer: "S"))
     var messages = sampleHistory()
     let before = messages

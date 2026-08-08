@@ -43,7 +43,7 @@ This design has two important consequences:
 
 2. **`wrapModelCall` can retry safely.** Because there is no live KV cache to keep in sync, a middleware that catches a rate-limit error can re-issue the identical `nextTurn` call without inconsistency. The rebuild is idempotent from the backend's perspective.
 
-The trade-off is that there is no persistent KV cache reuse across rounds. For on-device MLX inference this matters; the framework compensates through `SummarizationMiddleware`, which compacts history at around 85% of the context window to stay within bounds.
+The trade-off is that there is no persistent KV cache reuse across rounds. For on-device MLX inference this matters; the framework compensates through `SummarizationMiddleware`, which compacts history at 80% of the context window (`SummarizationConfig.triggerFraction`) to stay within bounds.
 
 Each adapter implements a message codec (`MessageCodec`) that translates `AgentMessage` values into the backend's native wire format. The core framework never sees provider-specific types; the codec is the only place where `AgentMessage.Role` maps to, say, an Anthropic `role: "user"` or an OpenAI `role: "user"`.
 

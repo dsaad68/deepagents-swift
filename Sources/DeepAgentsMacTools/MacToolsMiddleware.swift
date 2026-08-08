@@ -50,6 +50,10 @@ public struct SpotlightTool: AgentTool {
             + "Searches the whole Mac unless you pass path to scope it."
     }
 
+    /// A Spotlight query changes nothing. The rest of this toolset acts on the Mac - `open`,
+    /// `download`, `say`, `notify` - so they keep their place in the round's order.
+    public var isParallelSafe: Bool { true }
+
     public var parameters: [ToolParameter] {
         [
             .required("query", type: .string, description: "Spotlight query (a filename or words in a document)."),

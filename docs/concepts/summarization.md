@@ -25,7 +25,7 @@ The rewritten history has this shape:
 
 ### Automatically
 
-The middleware measures the request on every `beforeModel` call. When it crosses `triggerFraction` (default 0.85) of the model's `contextWindowTokens` (or the fallback window if the model does not report one), it compacts before the model call proceeds.
+The middleware measures the request on every `beforeModel` call. When it crosses `triggerFraction` (default 0.80) of the model's `contextWindowTokens` (or the fallback window if the model does not report one), it compacts before the model call proceeds.
 
 ### Manually: `compact(threadId:)`
 
@@ -71,7 +71,7 @@ The offload happens only AFTER a usable, shrinking summary is produced, so a fai
 
 ```swift
 public struct SummarizationConfig: Sendable {
-    public var triggerFraction: Double        // default 0.85
+    public var triggerFraction: Double        // default 0.80
     public var fallbackContextWindow: Int     // default 32768
     public var keepRecentMessages: Int        // default 6
     public var keepRecentFraction: Double     // default 0.25
@@ -84,7 +84,7 @@ public struct SummarizationConfig: Sendable {
 
 | Knob | Default | Meaning |
 |---|---|---|
-| `triggerFraction` | `0.85` | Fraction of the window at which automatic compaction fires |
+| `triggerFraction` | `0.80` | Fraction of the window at which automatic compaction fires |
 | `fallbackContextWindow` | `32768` | Window assumed when the model does not report one |
 | `keepRecentMessages` | `6` | Upper bound on kept recent messages |
 | `keepRecentFraction` | `0.25` | Token ceiling on the tail, as a fraction of the window |

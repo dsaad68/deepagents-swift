@@ -44,6 +44,10 @@ public struct ReadClipboardTool: AgentTool {
             + "Returns {\"clipboard_text\": \"…\"}."
     }
 
+    /// Reads the pasteboard and nothing else. It is only ever unsafe next to `write_clipboard`,
+    /// which is not parallel-safe and therefore never shares a batch with it.
+    public var isParallelSafe: Bool { true }
+
     public func execute(
         _ arguments: [String: AgentJSON], _ context: ToolContext
     ) async throws -> ToolOutput {

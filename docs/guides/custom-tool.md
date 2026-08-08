@@ -15,6 +15,7 @@ public protocol AgentTool: Sendable {
     var parameters: [ToolParameter] { get }
     func execute(_ arguments: [String: AgentJSON], _ context: ToolContext) async throws -> ToolOutput
     func toolSchema() -> ToolSchema
+    var isParallelSafe: Bool { get }
 }
 ```
 
@@ -28,6 +29,8 @@ Four things to implement:
 | `execute` | The async implementation; receives parsed args and a context handle |
 
 `toolSchema()` is derived automatically for most cases - the default implementation serializes `name`, `description`, and `parameters` into the JSON Schema format the framework passes to the model. You only need to override it for unusual schema shapes.
+
+`isParallelSafe` defaults to `false`, which keeps the tool in the round's serial order. Override it to `true` only for a tool that neither writes anything nor needs to see an earlier call's result - see [Parallel-safe tools](#parallel-safe-tools) below.
 
 ---
 
@@ -116,6 +119,47 @@ return ToolOutput(text: "Result: 42.00")
 ```
 
 The text becomes the content of the tool-result message. Keep it informative - the model reads it in the next round to decide what to do next.
+
+### Report a failure as a failure
+
+A tool that could not do what was asked should return `ToolOutput.failure(...)` rather than a plain
+`ToolOutput` whose text happens to begin with "Error":
+
+```swift
+return ToolOutput.failure("Error: no file at \"\(path)\".")
+```
+
+The model receives the text **identically** either way - `.failure` is for recovery, not for hiding
+the message. What changes is how the run reports the call: `.toolFailed` instead of
+`.toolCompleted`, and the call counts as failed for the duplicate-round guard.
+
+This matters because a host has no other way to know. Before it existed, every built-in tool
+returned its errors as ordinary output, so `read_file` answering `Error: no file at "https://…"`
+was drawn in the transcript with a **success tick** - telling the user a call had worked when it
+had done nothing.
+
+Throwing also reports a failure and is right for genuinely exceptional cases, but the thrown error
+is re-described and wrapped before the model sees it. Return `.failure` when the wording is meant
+to help the model correct itself.
+
+### Make the result say what it is
+
+The single most common cause of a small model looping is a result that doesn't read like an answer. The `tool` role already marks the turn as a result, but it says nothing about *what* the result is, and a bare fragment gets read as noise:
+
+| Bad | Why it loops | Good |
+|---|---|---|
+| `## main` | Reads like a markdown heading, not a status | `On branch main. The working tree is clean - no files added, changed, or deleted.` |
+| `99` | An unlabeled number; the model has to remember which call it answers | `(12 * 8) + 3 = 99` |
+| `(no output)` | Did it work, or do nothing? | `The command finished successfully and printed no output.` |
+| `` (empty) | Indistinguishable from a broken tool | `No matches for /foo/ under "src".` |
+
+This is not hypothetical. A 2.6B planner asked for `git_status` on a clean tree re-called it in five consecutive rounds, because 22 characters of branch line never read as "here is the status". `read_clipboard` carries a comment recording the same failure from an earlier round of this.
+
+The rules of thumb:
+
+- **Name the thing in the result**, especially when the value is a short scalar. Echo the input where it disambiguates ("`<expression>` = `<value>`").
+- **An empty result is a finding, so state it** - "no staged changes", "no matches", "the file is empty" - never an empty string or a bare `(none)`.
+- **Don't wrap large text in JSON.** Escaping turns every newline into `\n` and inflates a file read by ~6%, which makes it harder for a small model to read, not easier. Reserve structure for small values, the way `read_clipboard` returns `{"clipboard_text": …}` with a `note` when it's empty. Errors are the framework's own `{"error": …}` shape, applied for you.
 
 ---
 
@@ -208,6 +252,37 @@ func execute(_ arguments: [String: AgentJSON], _ context: ToolContext) async thr
     return ToolOutput(text: body)
 }
 ```
+
+---
+
+## Parallel-safe tools
+
+If your tool only reads - a lookup, a search, a GET - declare it parallel-safe so several calls to it in one round run at once:
+
+```swift
+struct StockQuoteTool: AgentTool {
+    var name: String { "stock_quote" }
+    var description: String { "Look up the current price of a ticker symbol." }
+    var parameters: [ToolParameter] {
+        [.required("symbol", type: .string, description: "Ticker symbol, e.g. AAPL")]
+    }
+
+    /// A quote lookup writes nothing and needs nothing from the round's other calls.
+    var isParallelSafe: Bool { true }
+
+    func execute(_ arguments: [String: AgentJSON], _ context: ToolContext) async throws -> ToolOutput {
+        // …
+    }
+}
+```
+
+Leave the default in place if any of these is true:
+
+- The tool writes - to disk, to state, to a remote service, to the clipboard.
+- The tool needs to see what an earlier call in the same round did. Calls in a concurrent batch all receive the same `context.state`, taken before the batch ran.
+- Two simultaneous invocations would contend - a lock, a working directory, a single-user device or app.
+
+You do not need to handle the approval case: a gated tool still fans out, and `HumanInTheLoopMiddleware` queues the approval requests so the user is only ever shown one at a time.
 
 ---
 

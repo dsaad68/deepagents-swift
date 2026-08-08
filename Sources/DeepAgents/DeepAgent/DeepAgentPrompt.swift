@@ -14,7 +14,13 @@ public enum DeepAgentPrompt {
     /// subagent pillars are always in the deep-agent stack, but the filesystem one is
     /// optional (`includeFilesystem`) — mentioning `write_file` without the tool would
     /// have the model calling a tool that doesn't exist.
-    static func system(includeFilesystem: Bool = true) -> String {
+    /// - Parameter workspaceRoot: the folder the file and search tools are rooted at. Stating it is
+    ///   not a nicety: with nothing to go on a model invents one, and every invented path is a
+    ///   refused call and a wasted round. Measured across 47 on-device runs, 30 of them contained
+    ///   `outside the allowed folder` errors - 148 refused calls in total - including a model on
+    ///   macOS guessing the Linux path `/home/user`, and one guessing the project's name rather
+    ///   than the checkout it was actually running in.
+    static func system(includeFilesystem: Bool = true, workspaceRoot: URL? = nil) -> String {
         let filesystemBullet = includeFilesystem
             ? """
             - Use your filesystem for working state. Save notes, drafts, and intermediate results \
@@ -22,6 +28,14 @@ public enum DeepAgentPrompt {
 
             """
             : ""
+        let locationBullet = workspaceRoot.map {
+            """
+            - Your working folder is `\($0.path)`. Paths you pass to tools are resolved inside it, \
+            and anything outside it is refused - so prefer relative paths, and never guess an \
+            absolute path from a project's name.
+
+            """
+        } ?? ""
         return """
         You are a deep agent: you tackle complex, multi-step tasks methodically rather than \
         answering off the cuff.
@@ -31,7 +45,9 @@ public enum DeepAgentPrompt {
         - Delegate isolated subtasks. Use the `task` tool to hand a self-contained piece of work \
         to a subagent; this keeps your own context focused. Give the subagent everything it \
         needs — it can't ask follow-ups.
-        \(filesystemBullet)- Verify before finishing. Check that you actually did what was asked, then give a clear, \
+        - Ask for independent lookups together. When you need to read a few files, or search for \
+        several things, request them all in one message instead of one at a time.
+        \(locationBullet)\(filesystemBullet)- Verify before finishing. Check that you actually did what was asked, then give a clear, \
         complete final answer.
         """
     }

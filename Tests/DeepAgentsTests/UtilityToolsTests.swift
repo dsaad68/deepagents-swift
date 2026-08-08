@@ -19,7 +19,9 @@ struct UtilityToolsTests {
         for testCase in cases {
             let output = try await CalculatorTool()
                 .execute(["expression": .string(testCase.expression)], ToolContext())
-            #expect(output.content == testCase.expected)
+            // The result echoes the expression: a bare "99" in a `tool` turn is an unlabeled
+            // fragment, and leaves the model to remember which of several calls it answers.
+            #expect(output.content == "\(testCase.expression) = \(testCase.expected)")
         }
     }
 
@@ -61,7 +63,7 @@ struct UtilityToolsTests {
         for testCase in cases {
             let output = try await CalculatorTool()
                 .execute(["expression": .string(testCase.expression)], ToolContext())
-            #expect(output.content == testCase.expected)
+            #expect(output.content == "\(testCase.expression) = \(testCase.expected)")
         }
     }
 

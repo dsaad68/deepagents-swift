@@ -39,20 +39,24 @@ public struct FetchTool: AgentTool {
         "Fetch a URL over HTTP(S) and return its contents as readable text (HTML is stripped)."
     }
 
+    /// A GET and nothing else, so several URLs in one round fetch at once. `curl` stays serial:
+    /// it can POST or DELETE, and two writes to one endpoint are exactly what ordering is for.
+    public var isParallelSafe: Bool { true }
+
     public var parameters: [ToolParameter] {
         [.required("url", type: .string, description: "The URL to fetch (http or https).")]
     }
 
     public func execute(_ arguments: [String: AgentJSON], _ context: ToolContext) async throws -> ToolOutput {
         guard let raw = ToolArgs.string(arguments, "url"), let url = WebTools.url(from: raw) else {
-            return ToolOutput("Error: a valid http(s) `url` is required.")
+            return ToolOutput.failure("Error: a valid http(s) `url` is required.")
         }
         do {
             let response = try await client.send(HTTPRequest(url: url))
             let header = "GET \(response.finalURL.absoluteString) -> \(response.statusCode)"
             return ToolOutput("\(header)\n\n\(WebTools.readableBody(response))")
         } catch {
-            return ToolOutput("Error: couldn't fetch \(url.absoluteString): \(error.localizedDescription)")
+            return ToolOutput.failure("Error: couldn't fetch \(url.absoluteString): \(error.localizedDescription)")
         }
     }
 }
@@ -83,11 +87,11 @@ public struct CurlTool: AgentTool {
 
     public func execute(_ arguments: [String: AgentJSON], _ context: ToolContext) async throws -> ToolOutput {
         guard let raw = ToolArgs.string(arguments, "url"), let url = WebTools.url(from: raw) else {
-            return ToolOutput("Error: a valid http(s) `url` is required.")
+            return ToolOutput.failure("Error: a valid http(s) `url` is required.")
         }
         let method = (ToolArgs.string(arguments, "method") ?? "GET").uppercased()
         guard WebTools.methods.contains(method) else {
-            return ToolOutput("Error: unsupported method \"\(method)\". Use one of \(WebTools.methods.joined(separator: ", ")).")
+            return ToolOutput.failure("Error: unsupported method \"\(method)\". Use one of \(WebTools.methods.joined(separator: ", ")).")
         }
         let headers = ToolArgs.stringMap(arguments, "headers")
         let body = ToolArgs.rawString(arguments, "body").map { Data($0.utf8) }
@@ -97,7 +101,7 @@ public struct CurlTool: AgentTool {
             )
             return ToolOutput(WebTools.rawSummary(method: method, response: response))
         } catch {
-            return ToolOutput("Error: \(method) \(url.absoluteString) failed: \(error.localizedDescription)")
+            return ToolOutput.failure("Error: \(method) \(url.absoluteString) failed: \(error.localizedDescription)")
         }
     }
 }

@@ -7,6 +7,138 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Fixed
+
+- **A tool that fails without throwing is now reported as a failure.** Most built-in tools return
+  their errors (`ToolOutput("Error: no file at …")`) rather than throwing, because the wording is
+  meant for the model to recover from - but the run emitted `.toolCompleted`, so a host drew a
+  success tick on a call that did nothing. `read_file` given a URL rendered as ✓ beside
+  `Error: no file at "https://…"`. `ToolOutput.failure(...)` marks a returned failure; the model
+  receives the same text, `.toolFailed` is emitted instead, and the call counts as failed for the
+  duplicate-round guard. All 47 error returns across the eight toolsets are converted. Neither host
+  needed a change - both already rendered `.toolFailed` correctly; the event was simply wrong.
+- **An MCP call missing a required argument is refused locally, naming what is missing.** Forwarded
+  blind, the mistake came back in the server's own dialect - a Pydantic dump naming
+  `v1_extract_toolArguments` - which a model cannot act on; a 2.6B sent `url` for a `urls` array and
+  then repeated the identical call on the next URL. It now gets "Missing required argument `urls`
+  (array). You passed `url`, which this tool does not take…". Only `required` is checked: types,
+  `anyOf`, unknown extras and nested requirements pass through, and an unparseable schema falls
+  open, because refusing a call the server would have accepted is worse than forwarding one it
+  rejects.
+
+### Changed
+
+- **`read_file` says it is not for web pages, and names what is.** A small model picks its tool from
+  the description line, and a 2.6B spent 29 seconds calling `read_file` with
+  `file_path: https://…/banana-bread-recipe/`. Both the tool description and the filesystem prompt
+  guidance now say a URL is not a file path and point at the web tools. Unvalidated against the
+  measurement harness so far.
+
+### Fixed
+
+- **`grep` and `glob` no longer report an absence they never established.** `FileWalk` caps how many
+  files it visits; when that cap was reached the tools still answered "No matches", which is
+  indistinguishable from a genuine miss. Measured on the Mispher repo, `Ripple/build` holds 23,288
+  files - 96% of everything under the root - so a walk from the root spent its whole budget inside
+  build output and reached no source file at all: `grep isParallelSafe` reported the symbol did not
+  exist while it sat in `Sources/DeepAgents/Tools/AgentTool.swift`, and the agent burned 11 and 18
+  rounds trying to reconcile that with a question presuming otherwise. Build output and vendored
+  dependencies (`build`, `DerivedData`, `node_modules`, `Pods`, `Carthage`, `__pycache__`) are now
+  skipped, the cap is 20,000 rather than 5,000, and a truncated walk says so instead of claiming
+  nothing matched. `tree` names a skipped folder rather than descending it. The skip list is
+  deliberately short: a wrongly skipped directory is the same bug from the other side.
+- **The agent is told which folder it is working in.** Nothing stated it - the prompts said "your
+  working folder" while tools resolved paths against a root the model could not see - so it guessed.
+  Across 47 on-device runs, 30 contained `outside the allowed folder` errors, 148 refused calls in
+  total, including a model on macOS reaching for the Linux path `/home/user` and one reaching for a
+  checkout named after the project rather than the worktree it was running in. Every refusal is a
+  wasted round. `DeepAgentPrompt.system` now takes a `workspaceRoot` and names it, along with what
+  happens to paths outside it; `createDeepAgent` supplies it from a real-disk backend, and the
+  in-memory scratch filesystem still names nothing.
+
+### Changed
+
+- **Every catalog model now reports the context window and generation budget its model card
+  documents.** The registry matched repo-id substrings in an ordered chain, and a row that hit the
+  wrong branch inherited the wrong numbers silently. LFM2.5-8B-A1B was the worst case: a
+  *reasoning* model ("explicit chain of thought before the final answer") with a 128k window, it
+  declared 32k of context and 4,096 output tokens, because its branch sat above every reasoning
+  branch. It now reports 128,000 / 8,192 as its card and `config.json` do. Ornith and Qwen3.6 report
+  262,144, Gemma 4 reports 128,000; these were flattened to a 40,960 clamp that made the context
+  meter and the compaction trigger describe a model that doesn't exist. Qwen3.6's output budget goes
+  8,192 → 32,768, the "most queries" figure on its card (the old value was argued down from the
+  81,920 competition-math figure). `ModelBudgetTests` pins every row to the card it came from.
+- **Compaction fires at 80% of the context window, was 85%.** With windows no longer pre-shrunk,
+  `SummarizationConfig.triggerFraction` is what keeps a session inside what the hardware can carry -
+  a model's window is what it was *trained* for, and several on-device models document windows far
+  past what a laptop holds. Hosts should expose it; Ripple reads it from `settings.json`.
+
+### Fixed
+
+- **A run no longer ends with an empty answer.** "No tool calls" was treated as "here is the
+  answer", so a reasoning model that spent its whole turn inside `<think>` completed the run with
+  nothing shown - observed on-device as five rounds of real tool work, 6,788 reasoning chunks and
+  zero answer tokens. A silent turn is now dropped and the model asked once for the answer it never
+  wrote, with its own reasoning quoted back so answering is a summary rather than a re-derivation.
+  If even that turn stays silent the run replies with the reasoning under a label saying whose words
+  they are, and with nothing at all to salvage it says so plainly. The same guarantee covers the
+  iteration cap and the duplicate-round guard, which force a final turn of their own.
+
+### Added
+
+- **`ModelTurnSession.nextTurn(…, startingOutsideReasoning:)`** - generate a turn that begins in the
+  answer channel rather than the reasoning one. A chat template that opens `<think>` for every turn
+  means an answer only reaches `text` once the model emits `</think>`, so asking a model that has
+  already thought itself silent to "answer in plain text" asks it to answer on a channel that is not
+  open; this closes the block up front instead. `ReactAgent`'s forced final turn uses it. The
+  requirement ships with a default implementation that ignores the flag, so existing conformers are
+  unaffected. In the MLX adapter it appends `</think>` to the prompt (LFM2.5-2.6B, Ornith) or turns
+  the thought channel off (Gemma 4).
+
+- **A round's independent tool calls run concurrently.** `AgentTool.isParallelSafe` (default
+  `false`) declares that a tool neither writes anything another call in the round could care about
+  nor needs an earlier call's result. The loop splits a round into batches: each run of consecutive
+  parallel-safe calls executes at once (at most four), everything else keeps its place in the serial
+  order and still sees everything dispatched before it. Three `read_file` calls now cost one read
+  instead of three. Declared by the read-only toolset: `ls`, `read_file`, `grep`, `glob`, `tree`,
+  `head`, `tail`, `diff`, `fetch`, every `git_*` tool, `current_datetime`, `calculator`, `mdfind`,
+  `read_clipboard`. Everything that writes keeps the default, and the round-ordering guarantee with
+  it - a round of `write_file` then `read_file` still means what it looks like it means.
+- **Tool events carry the call they belong to.** `.toolStarted`, `.toolProgress`, `.toolCompleted`
+  and `.toolFailed` gained a `callID`, and `.toolStarted` a `batchID` shared by the calls that ran
+  together (`nil` when a call ran alone). **Hosts must pair on `callID`, not on the tool name**:
+  three `read_file` calls can be open at once and their completions arrive in whatever order they
+  finish, so "the most recent unfinished step with this name" attaches results to the wrong one.
+  `batchID` is what lets a host mark a group as having run in parallel. Both are `nil` only for an
+  event no call produced - one a host synthesized, or a step rebuilt from a stored transcript -
+  where name matching remains the right fallback.
+
+### Changed
+
+- **A batch announces every call before any of them runs**, then reports each completion as it
+  lands, so a host shows the whole group running rather than entries that appear already finished.
+  Tool *results* are still appended in call order, whatever order the calls finish in; the trained
+  chat format pairs each call with its result, in order. Events a tool emits through its
+  `ToolContext` (the `task` tool's `.toolProgress`, the shell's streamed output) are stamped with
+  the call id on the way out, since a tool does not know its own call.
+- **Approval requests are serialised, not dispatch.** A gated tool still fans out;
+  `HumanInTheLoopMiddleware` presents one request at a time and raises the next when the previous
+  decision returns. The queue holds the decision only, never the execution - an approved call runs
+  while the next card is up, and a host that answers the gate itself (an allowlist, accept-all, a
+  deny rule) never delays a batch. Excluding gated tools instead would have made the feature inert:
+  every read-only tool defaults to `ask` in `MiddlewareCatalog`.
+- **Terse tool results now say what they are.** A clean `git status` returned a bare `## main` - 22
+  characters that read as a markdown heading, not an answer - and a 2.6B planner re-called it five
+  rounds running. `git_status` states the branch and whether the tree is clean, spells out the
+  two-column porcelain codes (`modified:`, `untracked:`, `added (staged):`; an unrecognized code
+  keeps its raw line), and summarises the count before the file list. `git_diff`, `git_log` and
+  `git_blame` replace `(no output)` with what the emptiness means. `calculator` echoes the
+  expression (`(12 * 8) + 3 = 99`) instead of a bare number, and `shell` reports a silent success
+  rather than `(no output)`. See the [custom tool guide](docs/guides/custom-tool.md) for the rule.
+- **The read-only `git` tools pass `--no-optional-locks`**, so `status` and `diff` no longer take
+  `.git/index.lock` to opportunistically refresh the index - the one write that would make two of
+  them in a batch collide.
+
 ## [0.5.0] - 2026-08-06
 
 ### Added

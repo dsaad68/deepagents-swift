@@ -30,4 +30,38 @@ public protocol ModelTurnSession: AnyObject {
         tools: [any AgentTool],
         onChunk: @escaping @Sendable (AgentStreamChunk) -> Void
     ) async throws -> AgentMessage
+
+    /// As above, but the turn begins in the **answer** channel rather than the reasoning one.
+    ///
+    /// Reasoning models routinely have their chat template open a `<think>` block in the generation
+    /// prompt, so generation starts inside reasoning and only a closing `</think>` moves output into
+    /// the visible answer. A model that never emits that tag produces a turn whose text is empty no
+    /// matter what it wrote - the answer had nowhere to go. Asking such a model to "answer in plain
+    /// text" cannot work, because the channel it would answer on is not open.
+    ///
+    /// `startingOutsideReasoning` closes the block up front, so the very first token is answer text.
+    /// Use it where an answer is required and reasoning is not - ``ReactAgent``'s forced final turn.
+    /// The default implementation ignores it: a session whose model has no reasoning channel (or
+    /// whose template opens none) already starts in the answer.
+    func nextTurn(
+        messages: [AgentMessage],
+        systemPrompt: String?,
+        tools: [any AgentTool],
+        startingOutsideReasoning: Bool,
+        onChunk: @escaping @Sendable (AgentStreamChunk) -> Void
+    ) async throws -> AgentMessage
+}
+
+public extension ModelTurnSession {
+    func nextTurn(
+        messages: [AgentMessage],
+        systemPrompt: String?,
+        tools: [any AgentTool],
+        startingOutsideReasoning _: Bool,
+        onChunk: @escaping @Sendable (AgentStreamChunk) -> Void
+    ) async throws -> AgentMessage {
+        try await nextTurn(
+            messages: messages, systemPrompt: systemPrompt, tools: tools, onChunk: onChunk
+        )
+    }
 }

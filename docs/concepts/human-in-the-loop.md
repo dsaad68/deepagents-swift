@@ -99,6 +99,11 @@ let approvalHandler: ToolApprovalHandler = { request in
 }
 ```
 
+!!! note "One request at a time"
+    The handler is never called again while an earlier call is still outstanding, however many tools the round is running at once: the middleware queues concurrent requests and raises the next only when the previous decision returns. A host can hold a single pending request and suspend on one continuation.
+
+    The queue holds only the *decision*, not the tool's execution - an approved call runs while the next card is up, and a handler that answers on its own (an allowlist, accept-all, a deny rule) never slows a batch down. Waiters resume in arrival order, which for concurrently-dispatched calls is up to the scheduler, so a batch's cards may not follow the order the model emitted them; each card names its own tool and arguments, and results still reach the model in call order. See [Parallel-safe calls](agent-loop.md#parallel-safe-calls).
+
 ### `ToolApprovalDecision`
 
 ```swift

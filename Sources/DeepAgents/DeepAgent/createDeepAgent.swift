@@ -60,9 +60,15 @@ public func createDeepAgent(
         return HumanInTheLoopMiddleware(interruptOn: interruptOn, approvalHandler: approvalHandler)
     }()
 
-    let composedPrompt = [DeepAgentPrompt.system(includeFilesystem: includeFilesystem), systemPrompt]
-        .compactMap { $0 }
-        .joined(separator: "\n\n")
+    // Tell the agent where it is. Only a real-disk backend has a location worth naming; the
+    // in-memory scratch filesystem has no path a tool call could get wrong.
+    let workspaceRoot = (fileBackend as? LocalFilesystemBackend)?.rootURL
+    let composedPrompt = [
+        DeepAgentPrompt.system(includeFilesystem: includeFilesystem, workspaceRoot: workspaceRoot),
+        systemPrompt
+    ]
+    .compactMap { $0 }
+    .joined(separator: "\n\n")
 
     // The built-in deep-agent stack (planning, then filesystem, then subagents), followed by any
     // caller-supplied middleware, with human-in-the-loop last so it gates every tool. Order

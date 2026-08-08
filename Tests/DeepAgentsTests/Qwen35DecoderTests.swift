@@ -118,6 +118,17 @@ struct ThinkStreamTests {
         #expect(result.answer.isEmpty)
     }
 
+    /// The empty-answer bug at its source. With the template's `<think>` already open, every token
+    /// is reasoning until `</think>` - so a model that never emits the closing tag produces a turn
+    /// whose answer is empty *no matter what it wrote*. A silent turn does not mean the model said
+    /// nothing; it can mean the channel never opened. `ReactAgent`'s forced final turn closes the
+    /// block up front (`startingOutsideReasoning`) so its first token is answer text.
+    @Test func startInThinkWithNoClosingTagSwallowsTheAnswer() {
+        let result = run(["I checked every file. The branch is clean."], startInThink: true)
+        #expect(result.answer.isEmpty)
+        #expect(result.reasoning == "I checked every file. The branch is clean.")
+    }
+
     @Test func startInThinkRoutesLeadingContentToReasoning() {
         // Ornith: the opening `<think>` was prefilled into the prompt, so the stream starts in
         // reasoning and only the closing tag is generated.

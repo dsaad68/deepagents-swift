@@ -113,7 +113,7 @@ public struct ShellTool: AgentTool {
     public func execute(_ arguments: [String: AgentJSON], _ context: ToolContext) async throws -> ToolOutput {
         guard let command = ToolArgs.rawString(arguments, "command"),
               !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        else { return ToolOutput("Error: `command` is required.") }
+        else { return ToolOutput.failure("Error: `command` is required.") }
 
         // Backstop: re-check at execution time so the block also holds for a command the user
         // edited to something dangerous in the approval card (the middleware classified the
@@ -133,7 +133,7 @@ public struct ShellTool: AgentTool {
             )
             return ToolOutput(Self.format(result, timeout: seconds))
         } catch {
-            return ToolOutput("Error: \(error.localizedDescription)")
+            return ToolOutput.failure("Error: \(error.localizedDescription)")
         }
     }
 
@@ -145,6 +145,10 @@ public struct ShellTool: AgentTool {
         } else if result.status != 0 {
             body += (body.isEmpty ? "" : "\n") + "[Exited with status \(result.status).]"
         }
-        return body.isEmpty ? "(no output)" : body
+        // Reaching here means no output, no timeout and a zero exit - a silent success, which is the
+        // normal outcome for `mkdir`, `cp`, a passing test run. "(no output)" didn't say whether it
+        // worked, leaving a model to re-run the command to find out. (A failure never lands here:
+        // the status note above is appended first, so `body` is non-empty.)
+        return body.isEmpty ? "The command finished successfully and printed no output." : body
     }
 }

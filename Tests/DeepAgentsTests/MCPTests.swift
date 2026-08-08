@@ -157,6 +157,209 @@ struct MCPToolTests {
             _ = try await tool.execute(["q": .string("hi")], ToolContext())
         }
     }
+
+    // MARK: - Checking a call against the server's schema
+
+    // Forwarded blind, a wrong argument comes back in the server's own dialect. Observed with a
+    // 2.6B on a `web_fetch` whose schema requires `urls` (array): it sent `url`, got back
+    // `1 validation error for v1_extract_toolArguments\nurls\n Field required [type=missing…]`,
+    // and made the identical call again on the next URL. Nothing in that names the mistake.
+
+    /// A tool whose one required argument is an array, mirroring the `web_fetch` case.
+    private func arrayArgTool() -> (MCPTool, FakeMCPSession) {
+        let schema: Value = [
+            "type": "object",
+            "properties": ["urls": ["type": "array", "description": "URLs to fetch"]],
+            "required": ["urls"]
+        ]
+        let session = FakeMCPSession(
+            tools: [MCP.Tool(name: "web_fetch", description: "Fetch", inputSchema: schema)]
+        )
+        return (
+            MCPTool(
+                serverName: "srv", toolName: "web_fetch", toolDescription: "Fetch",
+                inputSchema: schema, session: session
+            ),
+            session
+        )
+    }
+
+    @Test func aMissingRequiredArgumentIsNamedAndNeverReachesTheServer() async throws {
+        let (tool, session) = arrayArgTool()
+        await #expect(throws: MCPToolError.self) {
+            _ = try await tool.execute(["url": .string("https://example.com")], ToolContext())
+        }
+        // Blocked locally: a call the server would only reject costs a round trip either way.
+        #expect(await session.lastCall == nil)
+    }
+
+    @Test func theComplaintNamesTheArgumentTheTypeAndTheNearMiss() {
+        let schema: Value = [
+            "type": "object",
+            "properties": ["urls": ["type": "array"]],
+            "required": ["urls"]
+        ]
+        let complaint = MCPTool.missingRequiredArgument(
+            ["url": .string("https://example.com")], schema: schema
+        )
+        let text = try? #require(complaint)
+        #expect(text?.contains("`urls`") == true)
+        #expect(text?.contains("array") == true)
+        #expect(text?.contains("`url`") == true) // the near miss it actually sent
+    }
+
+    /// The guard that matters most: a valid call must still go through. Rejecting work the server
+    /// would have accepted is worse than forwarding a bad call, which is why this checks only
+    /// `required` and never types, `anyOf`, or unknown extras.
+    @Test func aValidCallIsStillDispatched() async throws {
+        let (tool, session) = arrayArgTool()
+        _ = try await tool.execute(["urls": .array([.string("https://example.com")])], ToolContext())
+        #expect(await session.lastCall?.name == "web_fetch")
+    }
+
+    @Test func extraArgumentsAndLooseSchemasAreNeverBlocked() async throws {
+        let (tool, session) = tool()
+        // An unknown extra alongside everything required: the server may well accept it.
+        _ = try await tool.execute(["q": .string("hi"), "extra": .bool(true)], ToolContext())
+        #expect(await session.lastCall != nil)
+
+        // A schema that declares nothing required blocks nothing.
+        #expect(MCPTool.missingRequiredArgument([:], schema: ["type": "object"]) == nil)
+    }
+}
+
+/// Everything the schema check must **not** do, plus the shapes of what it does.
+///
+/// The risk this carries is not that it misses a bad call - that costs one round trip, which is
+/// what happened before it existed. The risk is that it refuses a call the server would have
+/// accepted, which costs the user a capability with no way to override it. So most of this suite
+/// is about calls that have to get through.
+struct MCPArgumentCheckTests {
+    private func schema(
+        properties: [String: Value] = ["urls": ["type": "array"]], required: Value = ["urls"]
+    ) -> Value {
+        ["type": "object", "properties": .object(properties), "required": required]
+    }
+
+    // MARK: - Never block a call the server might accept
+
+    @Test func aSatisfiedCallPasses() {
+        #expect(MCPTool.missingRequiredArgument(["urls": .array([.string("u")])], schema: schema()) == nil)
+    }
+
+    @Test func unknownExtrasPass() {
+        let arguments: [String: AgentJSON] = ["urls": .array([]), "depth": .int(2), "raw": .bool(true)]
+        #expect(MCPTool.missingRequiredArgument(arguments, schema: schema()) == nil)
+    }
+
+    /// The declared type is never enforced. A server may coerce a string to an array, or accept a
+    /// union the schema flattens - refusing here would be us overruling the server about its own
+    /// contract.
+    @Test func aRequiredArgumentOfTheWrongTypeStillPasses() {
+        #expect(MCPTool.missingRequiredArgument(["urls": .string("u")], schema: schema()) == nil)
+        #expect(MCPTool.missingRequiredArgument(["urls": .int(1)], schema: schema()) == nil)
+        #expect(MCPTool.missingRequiredArgument(["urls": .object([:])], schema: schema()) == nil)
+    }
+
+    /// An explicit null is a value the caller chose to send. Some servers treat it as "unset" and
+    /// some as a real argument; that is theirs to decide, not ours.
+    @Test func anExplicitNullPasses() {
+        #expect(MCPTool.missingRequiredArgument(["urls": .null], schema: schema()) == nil)
+    }
+
+    @Test func anEmptyOrAbsentRequiredListBlocksNothing() {
+        #expect(MCPTool.missingRequiredArgument([:], schema: schema(required: .array([]))) == nil)
+        #expect(MCPTool.missingRequiredArgument([:], schema: ["type": "object"]) == nil)
+        #expect(MCPTool.missingRequiredArgument([:], schema: ["type": "object", "properties": .object([:])]) == nil)
+    }
+
+    /// Malformed and exotic schemas fall open rather than shut. A server that describes itself in a
+    /// way we do not parse still gets its calls.
+    @Test func schemasWeCannotReadFallOpen() {
+        #expect(MCPTool.missingRequiredArgument([:], schema: .string("nonsense")) == nil)
+        #expect(MCPTool.missingRequiredArgument([:], schema: .null) == nil)
+        #expect(MCPTool.missingRequiredArgument([:], schema: .array([.string("q")])) == nil)
+        // `required` present but not a list of names.
+        #expect(MCPTool.missingRequiredArgument([:], schema: schema(required: .string("urls"))) == nil)
+        #expect(MCPTool.missingRequiredArgument([:], schema: schema(required: .array([.int(1)]))) == nil)
+    }
+
+    /// Only top-level `required` is checked. Nested requirements are the server's business, and
+    /// walking them would be the kind of full validation that starts refusing valid calls.
+    @Test func nestedRequirementsAreNotEnforced() {
+        let nested: Value = [
+            "type": "object",
+            "properties": ["query": [
+                "type": "object",
+                "properties": ["text": ["type": "string"]],
+                "required": ["text"]
+            ]],
+            "required": ["query"]
+        ]
+        #expect(MCPTool.missingRequiredArgument(["query": .object([:])], schema: nested) == nil)
+    }
+
+    // MARK: - What it catches, and what it says
+
+    @Test func aMissingRequiredArgumentIsCaught() {
+        let complaint = MCPTool.missingRequiredArgument(["url": .string("u")], schema: schema())
+        #expect(complaint != nil)
+    }
+
+    @Test func theComplaintListsEveryRequiredName() throws {
+        let two = schema(
+            properties: ["urls": ["type": "array"], "objective": ["type": "string"]],
+            required: ["urls", "objective"]
+        )
+        let complaint = try #require(MCPTool.missingRequiredArgument(["urls": .array([])], schema: two))
+        #expect(complaint.contains("`objective`")) // the one actually missing
+        #expect(complaint.contains("`urls`")) // …and the full requirement list
+    }
+
+    @Test func theArrayHintAppearsOnlyForArrays() throws {
+        let arrayComplaint = try #require(MCPTool.missingRequiredArgument([:], schema: schema()))
+        #expect(arrayComplaint.contains("pass a list"))
+
+        let stringSchema = schema(properties: ["q": ["type": "string"]], required: ["q"])
+        let stringComplaint = try #require(MCPTool.missingRequiredArgument([:], schema: stringSchema))
+        #expect(!stringComplaint.contains("pass a list"))
+        #expect(stringComplaint.contains("string"))
+    }
+
+    @Test func aPropertyWithNoDeclaredTypeIsStillNamed() throws {
+        let untyped = schema(properties: ["urls": .object([:])], required: ["urls"])
+        let complaint = try #require(MCPTool.missingRequiredArgument([:], schema: untyped))
+        #expect(complaint.contains("`urls`"))
+    }
+
+    // MARK: - The near-miss hint
+
+    @Test func theHintCatchesSingularPluralAndCase() {
+        #expect(MCPTool.isNearMiss("url", of: "urls"))
+        #expect(MCPTool.isNearMiss("urls", of: "url"))
+        #expect(MCPTool.isNearMiss("URLs", of: "urls")) // case-only: the argument is still missing
+        #expect(!MCPTool.isNearMiss("urls", of: "urls")) // identical is not a miss
+        #expect(!MCPTool.isNearMiss("objective", of: "urls"))
+    }
+
+    /// With several plausible near-misses the wording must not depend on dictionary ordering, or
+    /// the same call produces different text on different runs.
+    @Test func theHintIsStableAcrossRuns() throws {
+        let arguments: [String: AgentJSON] = [
+            "url": .string("u"), "URLS": .string("u"), "urlsList": .string("u")
+        ]
+        let first = try #require(MCPTool.missingRequiredArgument(arguments, schema: schema()))
+        for _ in 0 ..< 20 {
+            #expect(MCPTool.missingRequiredArgument(arguments, schema: schema()) == first)
+        }
+    }
+
+    @Test func noHintIsInventedWhenNothingResembles() throws {
+        let complaint = try #require(
+            MCPTool.missingRequiredArgument(["objective": .string("x")], schema: schema())
+        )
+        #expect(!complaint.contains("You passed"))
+    }
 }
 
 // MARK: - MultiServerMCPClient

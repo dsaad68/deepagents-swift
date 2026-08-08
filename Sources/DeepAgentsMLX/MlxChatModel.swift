@@ -183,15 +183,34 @@ public final class RebuildTurnSession: ModelTurnSession {
         tools: [any AgentTool],
         onChunk: @escaping @Sendable (AgentStreamChunk) -> Void
     ) async throws -> AgentMessage {
+        try await nextTurn(
+            messages: messages, systemPrompt: systemPrompt, tools: tools,
+            startingOutsideReasoning: false, onChunk: onChunk
+        )
+    }
+
+    public func nextTurn(
+        messages: [AgentMessage],
+        systemPrompt: String?,
+        tools: [any AgentTool],
+        startingOutsideReasoning: Bool,
+        onChunk: @escaping @Sendable (AgentStreamChunk) -> Void
+    ) async throws -> AgentMessage {
         // Encode the canonical history to the model's wire shape; the codec owns all format quirks.
         let family = codecFamily
+        // Close the block the template opened, so generation begins in the answer channel. Only
+        // meaningful where the template actually opens one - see ``templateOpensReasoning``.
+        let closeReasoning = startingOutsideReasoning && templateOpensReasoning
+        let outsideReasoning = startingOutsideReasoning
         let request = Self.encode(
             family: family, messages: messages, systemPrompt: systemPrompt,
             tools: tools, supportsVision: supportsVision
         )
         let supportsVision = supportsVision
         let parameters = generateParameters
-        let startsInReasoning = startsInReasoning
+        // With the block closed up front the stream starts in the answer, so the decoder must not
+        // be told it starts inside reasoning - it would route the answer to the reasoning channel.
+        let startsInReasoning = closeReasoning ? false : startsInReasoning
         // Prefix-cache inputs captured for the `@Sendable` closure: the slot to reuse/update, plus the
         // keys that must match for its KV to stay valid (same resident container, same system+tools).
         let slot = prefixCache
@@ -218,9 +237,14 @@ public final class RebuildTurnSession: ModelTurnSession {
             let userInput = UserInput(
                 messages: request.messages, images: images,
                 tools: request.toolSpecs.isEmpty ? nil : request.toolSpecs,
-                additionalContext: family == .gemma4 ? ["enable_thinking": true] : nil
+                // Gemma 4 opens its thought channel from the template flag rather than a literal
+                // tag, so a turn that must answer simply asks for it not to be opened.
+                additionalContext: family == .gemma4 ? ["enable_thinking": !outsideReasoning] : nil
             )
-            let lmInput = try await context.processor.prepare(input: userInput)
+            var lmInput = try await context.processor.prepare(input: userInput)
+            if closeReasoning {
+                lmInput = Self.closingReasoning(lmInput, tokenizer: context.tokenizer)
+            }
 
             var configuration = context.configuration
             if family == .lfm2 {
@@ -310,6 +334,37 @@ public final class RebuildTurnSession: ModelTurnSession {
                 messages, systemPrompt: systemPrompt, tools: tools, supportsVision: supportsVision
             )
         }
+    }
+
+    /// Whether this model's chat template opens a `<think>` block in the generation prompt, so the
+    /// stream starts inside reasoning and only a closing tag moves output to the visible answer.
+    /// Gemma 4 is excluded: it delimits thought differently and opens it from a template flag, which
+    /// ``nextTurn`` turns off directly rather than closing a tag.
+    private var templateOpensReasoning: Bool {
+        switch codecFamily {
+        case .lfm2: return startsInReasoning // only LFM2.5-2.6B's template prefills the tag
+        case .qwen35: return true // Ornith's template always prefills it
+        case .gemma4: return false
+        }
+    }
+
+    /// The prompt with `</think>` appended, closing the block the template opened so the model's
+    /// first generated token is answer text. This is the same empty-reasoning prefill used to turn
+    /// thinking off on models of this family, not a novel trick.
+    ///
+    /// Skipped when the prompt carries an attention mask: extending the tokens would leave the mask
+    /// the wrong length, and answering with reasoning intact beats generating from a corrupt prompt.
+    private static func closingReasoning(_ input: LMInput, tokenizer: any Tokenizer) -> LMInput {
+        guard input.text.mask == nil else { return input }
+        let closing = tokenizer.encode(text: "\(ThinkStream.endTag)\n\n", addSpecialTokens: false)
+        guard !closing.isEmpty else { return input }
+        let tokens = input.text.tokens
+        let appended = tokens.ndim == 1
+            ? concatenated([tokens, MLXArray(closing)])
+            : concatenated([tokens, MLXArray(closing).reshaped([1, closing.count])], axis: -1)
+        return LMInput(
+            text: .init(tokens: appended), image: input.image, video: input.video, audio: input.audio
+        )
     }
 
     /// A fresh per-turn decoder for `family`. `startsInReasoning` only applies to `.lfm2`: the

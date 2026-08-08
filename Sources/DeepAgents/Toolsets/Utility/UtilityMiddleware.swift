@@ -41,6 +41,8 @@ public struct CurrentDateTimeTool: AgentTool {
         "Get the current local date and time. Use this whenever the user asks about the date, the day of the week, or the time."
     }
 
+    public var isParallelSafe: Bool { true }
+
     public func execute(
         _ arguments: [String: AgentJSON], _ context: ToolContext
     ) async throws -> ToolOutput {
@@ -62,6 +64,8 @@ public struct CalculatorTool: AgentTool {
         "Evaluate a basic arithmetic expression with + - * / and parentheses, e.g. \"(12 * 8) + 3\"."
     }
 
+    public var isParallelSafe: Bool { true }
+
     public var parameters: [ToolParameter] {
         [.required("expression", type: .string, description: "The arithmetic expression to evaluate.")]
     }
@@ -70,18 +74,21 @@ public struct CalculatorTool: AgentTool {
         _ arguments: [String: AgentJSON], _ context: ToolContext
     ) async throws -> ToolOutput {
         guard case .string(let expression)? = arguments["expression"] else {
-            return ToolOutput("Error: `expression` is required.")
+            return ToolOutput.failure("Error: `expression` is required.")
         }
         guard let value = ArithmeticEvaluator.evaluate(expression) else {
             return ToolOutput(
                 "Error: couldn't evaluate \"\(expression)\". Use only numbers and + - * / ( )."
             )
         }
+        // Echo the expression with the result. A bare "99" is an unlabeled fragment in a `tool`
+        // turn - the same shape that made small models re-call `read_clipboard` to check an answer
+        // they already had - and it leaves the model to remember which of several calls it answers.
         // Render whole numbers without a trailing ".0".
-        if value == value.rounded(), abs(value) < 1e15 {
-            return ToolOutput(String(Int64(value)))
-        }
-        return ToolOutput(String(value))
+        let rendered = value == value.rounded() && abs(value) < 1e15
+            ? String(Int64(value))
+            : String(value)
+        return ToolOutput("\(expression) = \(rendered)")
     }
 }
 

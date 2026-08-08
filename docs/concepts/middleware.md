@@ -92,13 +92,15 @@ Provides file I/O through a pluggable `FilesystemBackend`. Two backends ship:
 
 Tools: `ls`, `read_file`, `write_file`, `edit_file`, `mkdir`. Pass a backend via `createDeepAgent`'s `backend:` parameter; it defaults to `StateBackend()` when `includeFilesystem: true`.
 
+With `LocalFilesystemBackend`, `createDeepAgent` also names the root in the system prompt ("Your working folder is `…`", plus a note that paths outside it are refused). Without it a model has nothing to go on and invents a path: across 47 on-device runs, 30 produced `outside the allowed folder` errors - 148 refused calls - including a model on macOS reaching for `/home/user`, and one reaching for a directory named after the project rather than the checkout it was running in. `StateBackend` names nothing, having no path a tool call could get wrong.
+
 ### `SubAgentMiddleware`
 
 Enables task delegation. Contributes the `task` tool; when the model calls `task`, the middleware routes execution to one of the registered `SubAgent` instances (or to a general-purpose sub-agent when `includeGeneralPurpose: true`). See [Subagents](subagents.md).
 
 ### `SummarizationMiddleware`
 
-Hooks `beforeModel` and compacts the conversation when the context window reaches ~85% of capacity. Summarised segments are replaced with a single synthetic message whose `source` field is set to identify it as compaction-synthesised. Configured via `SummarizationConfig` (pass `nil` to disable). See [Summarization](summarization.md).
+Hooks `beforeModel` and compacts the conversation when the context window reaches 80% of capacity. Summarised segments are replaced with a single synthetic message whose `source` field is set to identify it as compaction-synthesised. Configured via `SummarizationConfig` (pass `nil` to disable). See [Summarization](summarization.md).
 
 ### `HumanInTheLoopMiddleware`
 
