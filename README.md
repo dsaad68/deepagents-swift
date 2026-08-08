@@ -41,7 +41,7 @@ so the framework can be retargeted to any backend by writing a single `ChatModel
 ## Install
 
 ```swift
-.package(url: "https://github.com/dsaad68/deepagents-swift.git", from: "0.2.3")
+.package(url: "https://github.com/dsaad68/deepagents-swift.git", from: "0.5.0")
 ```
 
 Then depend on the products you need:

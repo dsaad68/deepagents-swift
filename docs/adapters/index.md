@@ -53,7 +53,7 @@ Pass the middleware instances in the `middleware:` array of `createAgent` or `cr
 
 ```swift
 // Package.swift
-.package(url: "https://github.com/dsaad68/deepagents-swift", from: "0.2.3")
+.package(url: "https://github.com/dsaad68/deepagents-swift", from: "0.5.0")
 
 // target dependencies - add only what you need:
 .product(name: "DeepAgents", package: "DeepAgents"),

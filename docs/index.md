@@ -91,7 +91,7 @@ let ok = await agent.run([.human("What is 2 + 2?")], threadId: "user-123") { eve
 Add the package to your `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/dsaad68/deepagents-swift", from: "0.2.3")
+.package(url: "https://github.com/dsaad68/deepagents-swift", from: "0.5.0")
 ```
 
 Then add the products you need to your target's `dependencies`. See [Installation](getting-started/installation.md) for the full setup guide.
