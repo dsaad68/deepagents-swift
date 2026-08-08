@@ -470,6 +470,119 @@ struct RunToolRewriteTests {
     }
 }
 
+@Suite("Signatures tell the model what is required")
+struct ToolSignatureTests {
+    /// A built-in tool with a required arg, optional args, and an enum-constrained one.
+    private struct NoteTool: AgentTool {
+        var name: String { "update_note" }
+        var description: String { "Modify an existing note." }
+        var parameters: [ToolParameter] {
+            [
+                .required("title", type: .string, description: "Title of the note to update."),
+                .required(
+                    "mode", type: .string, description: "How to write.",
+                    extraProperties: ["enum": ["append", "replace"]]
+                ),
+                .optional("index", type: .int, description: "Which match to use."),
+                .optional("tags", type: .array(elementType: .string), description: "Tags to set.")
+            ]
+        }
+
+        func execute(
+            _ arguments: [String: AgentJSON], _ context: ToolContext
+        ) async throws -> ToolOutput { ToolOutput("ok") }
+    }
+
+    /// A tool that publishes a server-style JSON Schema and leaves `parameters` empty - exactly what
+    /// ``MCPTool`` does.
+    private struct SchemaOnlyTool: AgentTool {
+        var name: String { "ask_question" }
+        var description: String { "Ask a repo a question." }
+
+        func toolSchema() -> ToolSchema {
+            [
+                "type": "function",
+                "function": [
+                    "name": name,
+                    "description": description,
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "repoName": ["type": "string", "description": "owner/repo."],
+                            "question": ["type": "string", "description": "What to ask."],
+                            "depth": ["type": "integer", "description": "How deep."]
+                        ] as [String: any Sendable],
+                        "required": ["repoName", "question"]
+                    ] as [String: any Sendable]
+                ] as [String: any Sendable]
+            ]
+        }
+
+        func execute(
+            _ arguments: [String: AgentJSON], _ context: ToolContext
+        ) async throws -> ToolOutput { ToolOutput("ok") }
+    }
+
+    @Test("Required parameters are marked, and marked on both sides")
+    func requiredIsExplicit() {
+        // `!` and `?` rather than "bare means required": the model should not have to infer which
+        // arguments it may omit, and the search result's legend states the convention.
+        let signature = ToolDocument.signature(of: NoteTool())
+
+        #expect(signature.contains("title!: string"))
+        #expect(signature.contains("index?: int"))
+        #expect(!signature.contains("title:")) // never an unmarked name
+    }
+
+    @Test("Required parameters come first, then optional ones alphabetically")
+    func orderingIsStableAndReadable() {
+        // Schema properties arrive as an unordered dictionary, so without a rule the signature - and
+        // the document text the retriever caches - would differ run to run.
+        let signature = ToolDocument.signature(of: NoteTool())
+        let expected = "update_note(title!: string, mode!: string (\"append\"|\"replace\"), "
+            + "index?: int, tags?: [string])"
+        #expect(signature == expected)
+        #expect(ToolDocument.signature(of: NoteTool()) == signature) // and is stable
+    }
+
+    @Test("An enum constraint is rendered inline")
+    func enumsAreShown() {
+        // A value the model cannot guess, and `schemaViolation` rejects a wrong one - so a wasted round
+        // unless it is in the signature.
+        #expect(ToolDocument.signature(of: NoteTool()).contains("\"append\"|\"replace\""))
+    }
+
+    @Test("A tool that only publishes a JSON Schema still gets a full signature")
+    func schemaOnlyToolsAreNotEmpty() {
+        // The MCP shape: `toolSchema()` is overridden and `parameters` is left empty. Reading
+        // `parameters` rendered every MCP tool as `ask_question()` - taking no arguments at all.
+        let specs = ToolDocument.parameterSpecs(of: SchemaOnlyTool())
+        #expect(specs.map(\.name) == ["repoName", "question", "depth"])
+        #expect(specs.filter(\.isRequired).map(\.name) == ["repoName", "question"])
+
+        let signature = ToolDocument.signature(of: SchemaOnlyTool())
+        #expect(signature == "ask_question(repoName!: string, question!: string, depth?: int)")
+    }
+
+    @Test("A tool with no parameters renders as taking none")
+    func noParameters() {
+        #expect(ToolDocument.signature(of: StubNamedTool("git_status")) == "git_status()")
+    }
+
+    @Test("The search result states the convention and describes the required arguments")
+    func resultExplainsRequiredArguments() async throws {
+        let corpus = ToolDocument.corpus(for: [NoteTool(), SchemaOnlyTool()])
+        let tool = SearchToolsTool(documents: corpus, retriever: LexicalToolRetriever(), limit: 5)
+        let text = try await tool.execute(["query": .string("update a note")], ToolContext()).content
+
+        #expect(text.contains("`arg!` must be passed")) // the legend
+        #expect(text.contains("update_note(title!: string"))
+        #expect(text.contains("title! - Title of the note to update."))
+        // Optional parameters stay name-and-type; the budget is spent where a wrong guess fails.
+        #expect(!text.contains("index? - "))
+    }
+}
+
 @Suite("search_tools results")
 struct SearchToolsResultTests {
     private var corpus: [ToolDocument] {
@@ -488,7 +601,9 @@ struct SearchToolsResultTests {
     func rendersSignatures() async throws {
         let text = try await result(query: "echo text")
 
-        #expect(text.contains("echo(text: string)")) // enough to call it without another lookup
+        // Enough to call it without another lookup - including which arguments are mandatory, which
+        // is the part a bare `text: string` left the model to guess at.
+        #expect(text.contains("echo(text!: string)"))
         #expect(text.contains("Searched toolsets:"))
     }
 

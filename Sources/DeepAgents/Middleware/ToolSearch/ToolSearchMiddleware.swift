@@ -205,13 +205,21 @@ struct SearchToolsTool: AgentTool {
             )
         }
 
+        // The legend is not decoration: a bare parameter name meaning "required" is an inference, and
+        // the whole point of the result is that the model can call the tool correctly first time.
         var lines = ["Found \(matches.count) tool(s) for \"\(query)\". Call one by name, "
-            + "or use run_tool if you cannot call a tool that is not in your own schema.", ""]
+            + "or use run_tool if you cannot call a tool that is not in your own schema. "
+            + "In the signatures below `arg!` must be passed and `arg?` is optional.", ""]
         var used = lines.joined(separator: "\n").count
         var omitted = 0
         for match in matches {
             guard let document = byName[match.name] else { continue }
-            let entry = "  \(document.signature)\n      \(document.summary)"
+            var entry = "  \(document.signature)\n      \(document.summary)"
+            // Spell out the mandatory arguments. Optional ones are left to name and type: these are
+            // the ones a wrong guess fails on, and the budget is better spent here than everywhere.
+            for parameter in document.parameters where parameter.isRequired && !parameter.description.isEmpty {
+                entry += "\n      \(parameter.label) - \(parameter.description)"
+            }
             if used + entry.count > Self.resultBudget {
                 omitted += 1
                 continue

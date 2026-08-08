@@ -46,6 +46,21 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Fixed
 
+- **`search_tools` now tells the model which arguments are required - and MCP tools get their
+  arguments at all.** Signatures were built from `AgentTool.parameters`, but that is only the
+  convenience a *built-in* tool declares: `MCPTool` overrides `toolSchema()` to inject the server's
+  JSON Schema verbatim and never populates `parameters`, so every MCP tool - the default auxiliary
+  tier - rendered as `ask_question()`, taking no arguments. Signatures now come from `toolSchema()`,
+  the requirement every tool honours, via a new `ToolDocument.parameterSpecs(of:)` and
+  `ToolParameterSpec`.
+
+  Required-ness is also explicit on both sides now (`title!: string`, `index?: int`) rather than a bare
+  name the model had to read as "required", the search result states that convention, and each required
+  parameter's description is spelled out beneath the signature. `enum` constraints render inline
+  (`mode!: string ("replace"|"append")`) because the model cannot guess them and `schemaViolation`
+  rejects a wrong value - a wasted round otherwise. Parameters are ordered required-first, then optional
+  alphabetically: JSON schema properties arrive unordered, so without a rule the signature (and the
+  document text the retriever caches) would differ between runs.
 - **Withholding a tool's schema now withholds the prose about it too.** Every capability middleware
   appends a prompt section naming its own tools (~6 KB across 11 of them), and stripping
   `ModelRequest.tools` never touched that. With `apple_notes` tiered auxiliary the prompt still said
