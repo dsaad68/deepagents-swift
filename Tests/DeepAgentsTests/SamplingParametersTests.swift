@@ -69,7 +69,9 @@ struct SamplingParametersTests {
             #expect(parameters.topP == 0.95)
             #expect(parameters.topK == 20)
             #expect(parameters.repetitionPenalty == nil)
-            #expect(parameters.maxTokens == 8192)
+            // The cards ask for 32,768 output "for most queries" and reserve 81,920 for competition
+            // math and coding. This used to be argued down from the 81,920 figure to 8192.
+            #expect(parameters.maxTokens == 32768)
         }
         // Only the 35B-A3B card adds presence_penalty 1.5 (the 27B card says 0.0).
         let moe = try #require(model("mlx-community/Qwen3.6-35B-A3B-OptiQ-4bit"))
@@ -125,17 +127,21 @@ struct SamplingParametersTests {
         }
     }
 
-    @Test func qwenFamilyReportsTheLargerContextWindow() throws {
+    /// Each family reports the window its own card documents. These were all flattened to a 40960
+    /// clamp, which made the context meter and the compaction trigger describe a model that doesn't
+    /// exist; fitting a session to the machine is ``SummarizationConfig/triggerFraction``'s job.
+    @Test func eachFamilyReportsItsCardContextWindow() throws {
         for id in [
-            "mlx-community/Ornith-1.0-9B-4bit",
-            "mlx-community/Qwen3.6-27B-OptiQ-4bit",
-            "mlx-community/Qwen3.6-35B-A3B-OptiQ-4bit",
-            "mlx-community/gemma-4-e4b-it-8bit",
-            "mlx-community/gemma-4-e4b-it-OptiQ-4bit"
+            "mlx-community/Ornith-1.0-9B-4bit", // card: --max-model-len 262144
+            "mlx-community/Qwen3.6-27B-OptiQ-4bit", // card: 262,144 natively
+            "mlx-community/Qwen3.6-35B-A3B-OptiQ-4bit"
         ] {
-            #expect(try #require(model(id)).contextWindowTokens == 40960)
+            #expect(try #require(model(id)).contextWindowTokens == 262_144)
         }
-        // The LFM2 family is unchanged.
+        for id in ["mlx-community/gemma-4-e4b-it-8bit", "mlx-community/gemma-4-e4b-it-OptiQ-4bit"] {
+            #expect(try #require(model(id)).contextWindowTokens == 128_000) // card: 128K
+        }
+        // The 32k LFM2 rows are unchanged - that is what their cards say.
         let lfm = try #require(model("LiquidAI/LFM2.5-1.2B-Instruct-MLX-bf16"))
         #expect(lfm.contextWindowTokens == 32768)
     }

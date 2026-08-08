@@ -1,10 +1,16 @@
 import Foundation
 
 /// Tunables for ``SummarizationMiddleware`` — Mispher's port of the knobs on LangChain/deepagents'
-/// `SummarizationMiddleware`. ``default`` matches deepagents: trigger at 85% of the model's context
-/// window, keep the most recent turns, and fall back to a 32k window for models that don't report one.
+/// `SummarizationMiddleware`. ``default`` triggers at 80% of the model's context window, keeps the
+/// most recent turns, and falls back to a 32k window for models that don't report one.
 public struct SummarizationConfig: Sendable {
-    /// Fraction of the model's context window at which automatic compaction fires (deepagents: 0.85).
+    /// Fraction of the model's context window at which automatic compaction fires.
+    ///
+    /// 0.80, where deepagents uses 0.85. This is the knob that keeps a session inside what the
+    /// hardware can actually carry: a model's window is what it was *trained* for, and several
+    /// on-device models document windows far past what a laptop will hold, so compaction - not a
+    /// smaller declared window - is where that limit belongs. Hosts should expose it; Ripple reads
+    /// it from `settings.json` as `compactionPercent`.
     public var triggerFraction: Double
     /// Context window assumed when the model doesn't report ``ChatModel/contextWindowTokens``.
     public var fallbackContextWindow: Int
@@ -26,7 +32,7 @@ public struct SummarizationConfig: Sendable {
     public var summaryPrompt: String
 
     public init(
-        triggerFraction: Double = 0.85,
+        triggerFraction: Double = 0.80,
         fallbackContextWindow: Int = 32768,
         keepRecentMessages: Int = 6,
         keepRecentFraction: Double = 0.25,

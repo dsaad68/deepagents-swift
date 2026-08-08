@@ -257,8 +257,10 @@ factory and appear only in the planner picker.
 | Qwen3.6 27B (OptiQ 4-bit) | ~20 GB | temp 1.0 · top-p 0.95 · top-k 20; text-only |
 | Qwen3.6 35B A3B (OptiQ 4-bit, MoE) | ~24.7 GB | as 27B + presence penalty 1.5 (per card) |
 
-The qwen3_5 family reports a 40k on-device context window (trained for 262k; memory is the real
-limit). The Qwen3.6 OptiQ quants carry per-layer bit overrides, handled by mlx-swift-lm's
+The qwen3_5 family reports the 262k window its cards document. Keeping a session inside what the
+machine can hold is `SummarizationConfig.triggerFraction`'s job (80% by default), not a smaller
+declared window - shrinking the number here made the context meter describe a model that does not
+exist. The Qwen3.6 OptiQ quants carry per-layer bit overrides, handled by mlx-swift-lm's
 `perLayerQuantization`.
 
 ## gemma4 family: Gemma 4 E4B
@@ -294,8 +296,8 @@ conversion *does* ship full processor configs, but mlx-swift-lm 3.31.4's MLXVLM 
 cannot load E-series checkpoints - its backbone builds K/V projections for every layer while its
 sanitize drops them for the `num_kv_shared_layers` tail, so weight verification always fails
 (upstream issue #338, fix pending in #384). Once that fix ships, the 8-bit row flips to
-`acceptsImages: true` for Ornith-style dual-role duty. Both report the 40k on-device context
-window (trained for 128k).
+`acceptsImages: true` for Ornith-style dual-role duty. Both report the 128k window their card
+documents.
 
 A follow-up will wire `mlx-community/gemma-4-E4B-it-assistant-bf16` - Google's 78.8M
 multi-token-prediction drafter for Gemma 4 - as a speculative-decoding accelerator (mlx-swift-lm

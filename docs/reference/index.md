@@ -73,7 +73,7 @@ Related adapter pages: [Adapters overview](../adapters/index.md), [MLX](../adapt
 | `SubAgentMiddleware` | Delegation via the `task` tool |
 | `SubAgent` | Configuration for one subagent (model + tools + prompt) |
 | `TaskTool` | The `task` tool that dispatches to a subagent |
-| `SummarizationMiddleware` | Automatic context compaction at ~85% context window |
+| `SummarizationMiddleware` | Automatic context compaction at 80% context window |
 | `SummarizationConfig` | Tuning for the summarization trigger threshold and prompt |
 | `HumanInTheLoopMiddleware` | Approval gating via `wrapToolCall` |
 | `ToolApprovalRequest` | Describes a pending tool call passed to the approval handler |

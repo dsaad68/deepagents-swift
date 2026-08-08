@@ -9,6 +9,45 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Fixed
 
+- **`grep` and `glob` no longer report an absence they never established.** `FileWalk` caps how many
+  files it visits; when that cap was reached the tools still answered "No matches", which is
+  indistinguishable from a genuine miss. Measured on the Mispher repo, `Ripple/build` holds 23,288
+  files - 96% of everything under the root - so a walk from the root spent its whole budget inside
+  build output and reached no source file at all: `grep isParallelSafe` reported the symbol did not
+  exist while it sat in `Sources/DeepAgents/Tools/AgentTool.swift`, and the agent burned 11 and 18
+  rounds trying to reconcile that with a question presuming otherwise. Build output and vendored
+  dependencies (`build`, `DerivedData`, `node_modules`, `Pods`, `Carthage`, `__pycache__`) are now
+  skipped, the cap is 20,000 rather than 5,000, and a truncated walk says so instead of claiming
+  nothing matched. `tree` names a skipped folder rather than descending it. The skip list is
+  deliberately short: a wrongly skipped directory is the same bug from the other side.
+- **The agent is told which folder it is working in.** Nothing stated it - the prompts said "your
+  working folder" while tools resolved paths against a root the model could not see - so it guessed.
+  Across 47 on-device runs, 30 contained `outside the allowed folder` errors, 148 refused calls in
+  total, including a model on macOS reaching for the Linux path `/home/user` and one reaching for a
+  checkout named after the project rather than the worktree it was running in. Every refusal is a
+  wasted round. `DeepAgentPrompt.system` now takes a `workspaceRoot` and names it, along with what
+  happens to paths outside it; `createDeepAgent` supplies it from a real-disk backend, and the
+  in-memory scratch filesystem still names nothing.
+
+### Changed
+
+- **Every catalog model now reports the context window and generation budget its model card
+  documents.** The registry matched repo-id substrings in an ordered chain, and a row that hit the
+  wrong branch inherited the wrong numbers silently. LFM2.5-8B-A1B was the worst case: a
+  *reasoning* model ("explicit chain of thought before the final answer") with a 128k window, it
+  declared 32k of context and 4,096 output tokens, because its branch sat above every reasoning
+  branch. It now reports 128,000 / 8,192 as its card and `config.json` do. Ornith and Qwen3.6 report
+  262,144, Gemma 4 reports 128,000; these were flattened to a 40,960 clamp that made the context
+  meter and the compaction trigger describe a model that doesn't exist. Qwen3.6's output budget goes
+  8,192 → 32,768, the "most queries" figure on its card (the old value was argued down from the
+  81,920 competition-math figure). `ModelBudgetTests` pins every row to the card it came from.
+- **Compaction fires at 80% of the context window, was 85%.** With windows no longer pre-shrunk,
+  `SummarizationConfig.triggerFraction` is what keeps a session inside what the hardware can carry -
+  a model's window is what it was *trained* for, and several on-device models document windows far
+  past what a laptop holds. Hosts should expose it; Ripple reads it from `settings.json`.
+
+### Fixed
+
 - **A run no longer ends with an empty answer.** "No tool calls" was treated as "here is the
   answer", so a reasoning model that spent its whole turn inside `<think>` completed the run with
   nothing shown - observed on-device as five rounds of real tool work, 6,788 reasoning chunks and
