@@ -7,7 +7,27 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Fixed
+
+- **A run no longer ends with an empty answer.** "No tool calls" was treated as "here is the
+  answer", so a reasoning model that spent its whole turn inside `<think>` completed the run with
+  nothing shown - observed on-device as five rounds of real tool work, 6,788 reasoning chunks and
+  zero answer tokens. A silent turn is now dropped and the model asked once for the answer it never
+  wrote, with its own reasoning quoted back so answering is a summary rather than a re-derivation.
+  If even that turn stays silent the run replies with the reasoning under a label saying whose words
+  they are, and with nothing at all to salvage it says so plainly. The same guarantee covers the
+  iteration cap and the duplicate-round guard, which force a final turn of their own.
+
 ### Added
+
+- **`ModelTurnSession.nextTurn(…, startingOutsideReasoning:)`** - generate a turn that begins in the
+  answer channel rather than the reasoning one. A chat template that opens `<think>` for every turn
+  means an answer only reaches `text` once the model emits `</think>`, so asking a model that has
+  already thought itself silent to "answer in plain text" asks it to answer on a channel that is not
+  open; this closes the block up front instead. `ReactAgent`'s forced final turn uses it. The
+  requirement ships with a default implementation that ignores the flag, so existing conformers are
+  unaffected. In the MLX adapter it appends `</think>` to the prompt (LFM2.5-2.6B, Ornith) or turns
+  the thought channel off (Gemma 4).
 
 - **A round's independent tool calls run concurrently.** `AgentTool.isParallelSafe` (default
   `false`) declares that a tool neither writes anything another call in the round could care about

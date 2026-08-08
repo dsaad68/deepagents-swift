@@ -57,22 +57,17 @@ public struct ReactAgent: Sendable {
             // One run-scoped, stateless model node; this loop owns the iteration and hands
             // it the full conversation each round.
             let session = model.makeSession()
+            let run = RunContext(session: session, threadId: threadId, onEvent: onEvent)
             var round = 0
-            // Duplicate-round guard: small models can re-issue the identical tool call(s)
-            // round after round (the convergence bug's signature). Track the previous
-            // round's call set; after `maxRepeatedRounds` consecutive repeats, stop
-            // dispatching and force a final answer instead of burning the iteration cap.
-            var previousSignature: [String]?
-            var previousRoundFailed = false
-            var repeatedRounds = 0
+            var repeats = RepeatGuard()
+            // Set once the loop has already nudged a silent model for its answer, so a model that
+            // only ever thinks ends the run instead of being asked again and again.
+            var nudgedForAnswer = false
 
             agentLoop: while true {
                 round += 1
                 if round > maxIterations {
-                    try await forceFinalAnswer(
-                        session: session, state: &state, round: round,
-                        threadId: threadId, onEvent: onEvent
-                    )
+                    try await forceFinalAnswer(state: &state, round: round, run: run)
                     break agentLoop
                 }
 
@@ -105,7 +100,14 @@ public struct ReactAgent: Sendable {
                 let calls = message.toolCalls
                 let malformed = message.malformedToolCallBlocks
                 onEvent(.roundCompleted(hadToolCalls: !calls.isEmpty || !malformed.isEmpty))
-                if calls.isEmpty, malformed.isEmpty { break agentLoop }
+                if calls.isEmpty, malformed.isEmpty {
+                    if !nudgedForAnswer {
+                        nudgedForAnswer = try await nudgeIfSilent(
+                            message, state: &state, round: round, run: run
+                        )
+                    }
+                    break agentLoop
+                }
 
                 // A round whose only tool calls were unparseable is not a final answer:
                 // feed the error back so the model can re-emit the call or answer in text.
@@ -114,38 +116,22 @@ public struct ReactAgent: Sendable {
                     continue agentLoop
                 }
 
-                // Duplicate-round guard: a call set identical to the previous round's
-                // can't produce new information — anything legitimately re-run (a file
-                // re-read after an edit, a fresh screenshot after a delegation) has a
-                // different call in between, so it is never consecutive-identical. The
-                // first repeat is not re-executed: the model gets a redirect to the
-                // result it already has. If it repeats again, force the final answer.
-                let signature = calls.map(\.signature).sorted()
-                if signature == previousSignature {
-                    repeatedRounds += 1
-                } else {
-                    repeatedRounds = 0
-                    previousSignature = signature
-                }
-                if repeatedRounds >= Self.maxRepeatedRounds {
-                    try await forceFinalAnswer(
-                        session: session, state: &state, round: round,
-                        threadId: threadId, onEvent: onEvent
-                    )
+                switch repeats.verdict(on: calls) {
+                case .stop:
+                    try await forceFinalAnswer(state: &state, round: round, run: run)
                     break agentLoop
-                }
-                if repeatedRounds > 0 {
+                case .redirect:
                     await appendDuplicateFeedback(
-                        RepeatedRound(calls: calls, previouslyFailed: previousRoundFailed),
+                        RepeatedRound(calls: calls, previouslyFailed: repeats.previousRoundFailed),
                         state: &state, round: round, threadId: threadId, onEvent: onEvent
                     )
                     continue agentLoop
+                case .dispatch:
+                    repeats.previousRoundFailed = await dispatchRound(
+                        message, state: &state, round: round,
+                        threadId: threadId, onEvent: onEvent
+                    )
                 }
-
-                previousRoundFailed = await dispatchRound(
-                    message, state: &state, round: round,
-                    threadId: threadId, onEvent: onEvent
-                )
             }
 
             for middleware in middleware.reversed() { await middleware.afterAgent(&state) }
@@ -194,6 +180,68 @@ public struct ReactAgent: Sendable {
         guard middleware.contains(where: { $0 is SummarizationMiddleware }) else { return }
         let overhead = SummarizationMiddleware.promptOverheadText(systemPrompt: systemPrompt, tools: tools)
         if !overhead.isEmpty { state.values[SummarizationMiddleware.promptOverheadStateKey] = overhead }
+    }
+
+    /// The collaborators every step of one run shares: the model node it drives, the thread it
+    /// logs against, and where its events go. Bundled because threading the three of them through
+    /// each helper by hand is what pushed those signatures past readable.
+    private struct RunContext {
+        let session: any ModelTurnSession
+        let threadId: String?
+        let onEvent: @Sendable (AgentEvent) -> Void
+    }
+
+    /// The duplicate-round guard: small models can re-issue the identical tool call(s) round after
+    /// round (the convergence bug's signature). It tracks the previous round's call set, because a
+    /// set identical to it can't produce new information — anything legitimately re-run (a file
+    /// re-read after an edit, a fresh screenshot after a delegation) has a different call in
+    /// between, so it is never consecutive-identical.
+    private struct RepeatGuard {
+        /// Whether every call in the round just dispatched failed, which `appendDuplicateFeedback`
+        /// needs to word its redirect truthfully.
+        var previousRoundFailed = false
+        private var previousSignature: [String]?
+        private var repeats = 0
+
+        /// What to do with this round's calls: run them, redirect the model to the result it
+        /// already has (the first repeat is never re-executed), or give up on it answering by
+        /// itself after `maxRepeatedRounds` and force the final answer.
+        enum Verdict { case dispatch, redirect, stop }
+
+        mutating func verdict(on calls: [AgentToolCall]) -> Verdict {
+            let signature = calls.map(\.signature).sorted()
+            if signature == previousSignature {
+                repeats += 1
+            } else {
+                repeats = 0
+                previousSignature = signature
+            }
+            if repeats >= ReactAgent.maxRepeatedRounds { return .stop }
+            return repeats > 0 ? .redirect : .dispatch
+        }
+    }
+
+    /// A round with no tool calls ordinarily ends the run - its text is the final answer. But "no
+    /// tool calls" is not "here is the answer": a reasoning model can spend the whole turn inside
+    /// `<think>` and never reach the visible text, and taking that as the answer completes the run
+    /// with an empty reply. Observed on-device on a 2.6B: five rounds of real tool work, then 6,788
+    /// reasoning chunks, zero answer tokens, and nothing shown to the user.
+    ///
+    /// So a silent turn is nudged, once, for the answer it never wrote. Returns whether it did -
+    /// the caller keeps that, because a model that only ever thinks must end the run rather than be
+    /// asked again every round until the iteration cap.
+    private func nudgeIfSilent(
+        _ message: AgentMessage, state: inout AgentState, round: Int, run: RunContext
+    ) async throws -> Bool {
+        guard message.text.isBlank else { return false }
+        // Drop the silent turn first: an empty assistant message renders as an empty turn in the
+        // chat template, which is not a shape the model was trained on.
+        let thinking = message.reasoning
+        state.messages.removeLast()
+        try await forceFinalAnswer(
+            state: &state, round: round, run: run, fallbackReasoning: thinking
+        )
+        return true
     }
 
     /// Run every middleware's `beforeModel` hook, then emit a `.contextCompacted` event if one of
@@ -361,6 +409,40 @@ public struct ReactAgent: Sendable {
     /// batch, still in call order.
     static let maxConcurrentToolCalls = 4
 
+    /// Prefixes an answer salvaged from the model's own reasoning, so the user is told they are
+    /// reading working-out rather than a considered reply (see ``forceFinalAnswer``).
+    static let salvagedAnswerNote =
+        "I didn't finish writing an answer. Here is what I was working through:"
+
+    /// The last resort, when the model produced neither an answer nor any reasoning to fall back
+    /// on. Names what happened and what to do about it, because a blank reply does neither.
+    static let noAnswerNote =
+        "I stopped without producing an answer. Ask me again, or rephrase the request."
+
+    /// The turn appended to the end of the conversation when the loop asks for the answer the model
+    /// never wrote. It is never stored: the user did not type it, so it must not appear in their
+    /// saved thread - only the answer it produces is kept.
+    ///
+    /// When there is reasoning to hand back, it is quoted, because the model then has to summarise
+    /// what it already worked out instead of deriving it again - and deriving it again is what
+    /// exhausted the turn in the first place.
+    static func answerRequest(reasoning: String?) -> AgentMessage {
+        guard let reasoning, !reasoning.isBlank else {
+            return .human(
+                "You stopped without writing an answer. Give me your final answer now, in plain "
+                    + "text, using the conversation above."
+            )
+        }
+        return .human("""
+        You were working on this and wrote the reasoning below, but you never wrote the answer \
+        itself:
+
+        \(reasoning)
+
+        Give me your final answer now, in plain text. Do not call any tools.
+        """)
+    }
+
     /// Longest tool result (in characters) fed back to the model. LFM models have a 32k
     /// context; one oversized `read_file`/`task` result can crowd out the conversation,
     /// so anything longer is cut with a note saying how much was dropped.
@@ -369,30 +451,62 @@ public struct ReactAgent: Sendable {
     /// One last model turn with NO tools declared (so the chat template omits the tool
     /// list entirely — the strongest "answer now" signal) plus an explicit instruction to
     /// answer in text. Used when the loop is cut short (iteration cap, duplicate-round
-    /// guard) so the user still gets an answer instead of a dangling tool result. Calls
-    /// the session directly: middleware `wrapModelCall` guidance describes tools that are
-    /// deliberately absent here. Any tool calls the model still emits are dropped.
+    /// guard, a turn that produced only reasoning) so the user still gets an answer instead
+    /// of a dangling tool result. Calls the session directly: middleware `wrapModelCall`
+    /// guidance describes tools that are deliberately absent here. Any tool calls the model
+    /// still emits are dropped.
+    ///
+    /// This is the last line of defence, so it does not hand back nothing: if even this turn
+    /// stays inside `<think>`, the run answers with the thinking - its own first, else
+    /// `fallbackReasoning` from the turn that prompted the nudge. A visible train of thought is a
+    /// poor answer, but it is an answer; a blank reply tells the user only that something broke.
     private func forceFinalAnswer(
-        session: any ModelTurnSession,
-        state: inout AgentState,
-        round: Int,
-        threadId: String?,
-        onEvent: @Sendable @escaping (AgentEvent) -> Void
+        state: inout AgentState, round: Int, run: RunContext, fallbackReasoning: String? = nil
     ) async throws {
+        let onEvent = run.onEvent
         let nudge = """
         Tool calling is now disabled. Using the conversation above, give the user your \
         final answer in plain text. Do not call any tools.
         """
         let prompt = [systemPrompt, nudge].compactMap { $0 }.joined(separator: "\n\n")
         let started = Date()
-        let message = try await session.nextTurn(
-            messages: state.messages, systemPrompt: prompt, tools: [],
+        // The ask goes at the *end* of the conversation, not only in the system prompt: the prompt
+        // sits thousands of tokens from where generation starts, and a model that has just thought
+        // itself silent is being handed the identical conversation again. A turn immediately before
+        // the generation point is the strongest position, and it can carry the model's own
+        // reasoning back so answering is a summary rather than a re-derivation.
+        //
+        // It is a `.human` turn rather than a mid-conversation `.system` one because system-role
+        // messages inside `messages` are model-gated - supported on Opus 4.8 and later, rejected
+        // with a 400 on Sonnet 5, Haiku, and older models. This path runs when a turn has already
+        // gone wrong; it must not be the thing that fails.
+        let messages = state.messages + [Self.answerRequest(reasoning: fallbackReasoning)]
+        // Start outside the reasoning channel. On a model whose template opens `<think>` for every
+        // turn, an answer only reaches `text` once the model emits `</think>` - so a turn that has
+        // already thought itself silent is being asked to answer on a channel that is not open.
+        // Closing it up front removes the requirement instead of restating it.
+        let message = try await run.session.nextTurn(
+            messages: messages, systemPrompt: prompt, tools: [],
+            startingOutsideReasoning: true,
             onChunk: Self.streamHandler(onEvent)
         )
-        let final = AgentMessage.ai(message.text)
+        var answer = message.text
+        if answer.isBlank {
+            // Say whose words these are. Unlabelled, reasoning reads as the answer - "let me try a
+            // different approach" looks like the agent is still working, when in fact it has
+            // stopped - and the user can't tell a considered reply from a salvaged monologue.
+            let thinking = [message.reasoning, fallbackReasoning].compactMap { $0 }.first { !$0.isBlank }
+            // With nothing to salvage either, the run still has to say something: a blank reply
+            // tells the user only that something broke, and not even that it was the model.
+            answer = thinking.map { Self.salvagedAnswerNote + "\n\n" + $0 } ?? Self.noAnswerNote
+            // A host builds the visible answer from `.token`, not from the stored message, so the
+            // salvaged text has to be streamed as well or the reply is blank on screen.
+            onEvent(.token(answer, isFinal: true))
+        }
+        let final = AgentMessage.ai(answer)
         state.messages.append(final)
         await messageLog?.append(
-            final, threadId: threadId,
+            final, threadId: run.threadId,
             context: AgentLogContext(
                 modelID: model.modelID, round: round,
                 generationSeconds: Date().timeIntervalSince(started)
@@ -713,4 +827,10 @@ private extension AgentToolCall {
     /// A deterministic identity for the duplicate-round guard: name plus the key-sorted
     /// argument rendering. Two calls with the same name and arguments compare equal.
     var signature: String { "\(name)(\(describedArguments))" }
+}
+
+private extension String {
+    /// Empty once whitespace is discounted. A model that answers with a stray newline has said
+    /// nothing, and the loop must treat it the same as saying nothing at all.
+    var isBlank: Bool { trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
 }
