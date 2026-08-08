@@ -9,6 +9,33 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Fixed
 
+- **A tool that fails without throwing is now reported as a failure.** Most built-in tools return
+  their errors (`ToolOutput("Error: no file at …")`) rather than throwing, because the wording is
+  meant for the model to recover from - but the run emitted `.toolCompleted`, so a host drew a
+  success tick on a call that did nothing. `read_file` given a URL rendered as ✓ beside
+  `Error: no file at "https://…"`. `ToolOutput.failure(...)` marks a returned failure; the model
+  receives the same text, `.toolFailed` is emitted instead, and the call counts as failed for the
+  duplicate-round guard. All 47 error returns across the eight toolsets are converted. Neither host
+  needed a change - both already rendered `.toolFailed` correctly; the event was simply wrong.
+- **An MCP call missing a required argument is refused locally, naming what is missing.** Forwarded
+  blind, the mistake came back in the server's own dialect - a Pydantic dump naming
+  `v1_extract_toolArguments` - which a model cannot act on; a 2.6B sent `url` for a `urls` array and
+  then repeated the identical call on the next URL. It now gets "Missing required argument `urls`
+  (array). You passed `url`, which this tool does not take…". Only `required` is checked: types,
+  `anyOf`, unknown extras and nested requirements pass through, and an unparseable schema falls
+  open, because refusing a call the server would have accepted is worse than forwarding one it
+  rejects.
+
+### Changed
+
+- **`read_file` says it is not for web pages, and names what is.** A small model picks its tool from
+  the description line, and a 2.6B spent 29 seconds calling `read_file` with
+  `file_path: https://…/banana-bread-recipe/`. Both the tool description and the filesystem prompt
+  guidance now say a URL is not a file path and point at the web tools. Unvalidated against the
+  measurement harness so far.
+
+### Fixed
+
 - **`grep` and `glob` no longer report an absence they never established.** `FileWalk` caps how many
   files it visits; when that cap was reached the tools still answered "No matches", which is
   indistinguishable from a genuine miss. Measured on the Mispher repo, `Ripple/build` holds 23,288
