@@ -61,6 +61,16 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   rejects a wrong value - a wasted round otherwise. Parameters are ordered required-first, then optional
   alphabetically: JSON schema properties arrive unordered, so without a rule the signature (and the
   document text the retriever caches) would differ between runs.
+- **The lazy-tools prompt section now says *when* to search, not just how.** It described the mechanism
+  only, so a planner read the index of tool names as reference material rather than an instruction:
+  cold, "list my apple notes" produced no `search_tools` call at all, while the same request *after* an
+  unrelated search worked - because by then real signatures were sitting in the conversation. The
+  section now names the two tiers explicitly, states the obligation ("if a request needs something your
+  visible tools do not cover, call `search_tools` before you answer"), and blocks the refusal ("never
+  tell the user you are unable to do something that one of the tools listed above does"). That last
+  line restores tier-agnostically what the per-tool prose used to do - `AppleNotesMiddleware` said
+  "never claim you can't" - and which was removed with that prose. `search_tools`' own description is
+  imperative for the same reason. Only added when the feature is on and something is auxiliary.
 - **The filesystem and subagent guidance is gated too.** `FilesystemMiddleware` writes its section
   through a `static func`, not the `static let` the other eleven use, so the first pass at gating
   guidance missed it: with `filesystem` tiered auxiliary the prompt still carried "## Working files with

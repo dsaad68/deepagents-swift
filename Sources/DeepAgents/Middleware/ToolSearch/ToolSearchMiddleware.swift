@@ -88,9 +88,8 @@ public struct ToolSearchMiddleware: AgentMiddleware, ToolRenderFiltering {
         return response
     }
 
-    /// The standing prompt section: the auxiliary tools' **names**, grouped by toolset, and nothing
-    /// else. No schemas, no per-tool prose, and constant for the life of the run - so it sits inside
-    /// the cached prefix and never moves the fingerprint.
+    /// The standing prompt section: the two tiers, the auxiliary tools' **names** grouped by toolset,
+    /// and - the part that actually changes behaviour - when the model is obliged to search.
     ///
     /// Names, not just toolset labels, because the index is what makes routing work. Asked "which
     /// Apple Notes tools do you have?", an agent given only "Apple Notes" as a topic has to guess or
@@ -98,6 +97,18 @@ public struct ToolSearchMiddleware: AgentMiddleware, ToolRenderFiltering {
     /// call one straight away (dispatch resolves auxiliary names, so a direct call succeeds - it only
     /// needs `search_tools` for the argument shapes). The whole index costs ~150 tokens against the
     /// ~1.5k of per-tool prose it replaces.
+    ///
+    /// The wording is imperative on purpose. An earlier version described the mechanism only - how to
+    /// call `search_tools`, never when - and a planner read an index of names as reference material
+    /// rather than as an instruction to act: cold, "list my apple notes" produced no search at all,
+    /// while the same request *after* an unrelated search worked, because by then real signatures were
+    /// sitting in the conversation. Two lines carry the fix: the obligation to search before answering,
+    /// and the refusal-block ("never tell the user you cannot…"). The latter restores, tier-agnostically,
+    /// something the per-tool prose used to do - `AppleNotesMiddleware` said "never claim you can't" -
+    /// which was removed with the rest of that prose and left nothing in its place.
+    ///
+    /// Constant for the life of the run, so it sits inside the cached prefix and never moves the
+    /// fingerprint.
     var systemPrompt: String {
         let byToolset = Dictionary(grouping: documents, by: \.toolsetDisplayName)
         let index = byToolset.keys.sorted().map { toolset in
@@ -105,17 +116,25 @@ public struct ToolSearchMiddleware: AgentMiddleware, ToolRenderFiltering {
         }
         .joined(separator: "\n")
         return """
-        ## Finding more tools
+        ## Your tools: core and auxiliary
 
-        These tools exist but their schemas are not loaded, so you cannot see their parameters:
+        You have two kinds of tools, and you can use all of them. **Core tools** are the ones whose \
+        schemas appear in this request - call them directly. **Auxiliary tools** are equally available \
+        to you, but their schemas are not loaded yet, so you cannot see their parameters. These are \
+        the auxiliary tools you have:
 
         \(index)
 
-        To use one, call `search_tools` with a short description of what you need ("read a note", \
-        "check git history"). It returns the exact signatures, and you then call the tool by name \
-        like any other. Do not invent a tool that is not listed above or in your own schema. If your \
+        **If a request needs something your visible tools do not cover, call `search_tools` before you \
+        answer.** Describe what you need in a few words ("list notes", "check git history"); it returns \
+        those tools' exact signatures, and you then call the tool by name like any other. One extra \
+        step, then the tool works normally.
+
+        Never tell the user you are unable to do something that one of the tools listed above does. You \
+        have that tool - you just need its signature first, so search for it and then use it. Do not \
+        invent a tool that appears neither in the list above nor in your own schema. If your output \
         format will not let you call a tool that is absent from your schema, call `run_tool` with the \
-        name and arguments instead.
+        tool's name and arguments instead.
         """
     }
 
@@ -166,10 +185,14 @@ struct SearchToolsTool: AgentTool {
     let limit: Int
 
     var name: String { "search_tools" }
+    /// Imperative, like the prompt section: the description is the only thing some models read before
+    /// deciding whether a tool applies, so it states the trigger rather than just the capability.
     var description: String {
-        "Find tools that are available but not listed in your prompt. Describe what you need to do "
-            + "(e.g. \"read a file\", \"check git history\") and this returns the matching tools' "
-            + "names and signatures, which you can then call directly."
+        "Look up your auxiliary tools - the ones you have but whose schemas are not loaded. Call this "
+            + "whenever a request needs something your visible tools do not cover, before telling the "
+            + "user anything is impossible. Describe what you need (e.g. \"list notes\", \"check git "
+            + "history\") and this returns the matching tools' names and exact signatures, which you "
+            + "then call directly."
     }
 
     /// Pure - it reads a fixed corpus and writes nothing - so it may run alongside the other

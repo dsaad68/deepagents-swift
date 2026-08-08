@@ -313,15 +313,37 @@ struct ToolSearchGuidanceTests {
         // Notes tools do you have?" or call one directly.
         let text = await prompt(auxiliary: true)
 
-        #expect(text.contains("Finding more tools"))
+        #expect(text.contains("core and auxiliary"))
         #expect(text.contains("Apple Notes: create_note, list_notes, read_note, update_note"))
     }
 
-    @Test("The index is far cheaper than the prose it replaces")
-    func indexIsCheaperThanProse() async {
+    @Test("The section tells the model when to search, not just how")
+    func sectionStatesTheObligation() async {
+        // The regression this guards: an earlier version described the mechanism only, and cold
+        // "list my apple notes" produced no search - the model read an index of names as reference
+        // material. Both of these lines are load-bearing.
+        let text = await prompt(auxiliary: true)
+
+        #expect(text.contains("call `search_tools` before you answer"))
+        #expect(text.contains("Never tell the user you are unable to do something"))
+    }
+
+    @Test("The obligation appears only when there are auxiliary tools")
+    func noObligationWhenEverythingIsCore() async {
+        let text = await prompt(auxiliary: false)
+        #expect(!text.contains("core and auxiliary"))
+        #expect(!text.contains("search_tools"))
+    }
+
+    @Test("One small toolset auxiliary can cost more prompt than it saves")
+    func theSectionIsAFixedCost() async {
+        // Worth pinning rather than hiding: the section (tiers, the obligation, the refusal-block) is a
+        // fixed ~1.4k charge, while the prose it replaces is *per toolset*. With a single toolset
+        // auxiliary the charge exceeds the saving - lazy tools pay off across many toolsets, not one.
+        // `ToolSearchWholeOutputTests.theIndexBeatsTheProseAcrossManyToolsets` is the case that matters.
         let auxiliaryPrompt = await prompt(auxiliary: true)
         let corePrompt = await prompt(auxiliary: false)
-        #expect(auxiliaryPrompt.count < corePrompt.count)
+        #expect(auxiliaryPrompt.count > corePrompt.count)
     }
 }
 
@@ -493,7 +515,7 @@ struct ToolSearchWholeOutputTests {
         let (agent, recorder) = makeAgent()
         _ = await agent.run([.human("hi")]) { _ in }
         let prompt = try #require(await recorder.systemPrompts.first.flatMap { $0 })
-        let index = try #require(prompt.components(separatedBy: "## Finding more tools").last)
+        let index = try #require(prompt.components(separatedBy: "## Your tools: core and auxiliary").last)
         let auxiliary = Set(agent.tools.map(\.name))
             .subtracting(agent.renderedTools.map(\.name))
 
@@ -524,6 +546,36 @@ struct ToolSearchWholeOutputTests {
                 #expect(!ToolDocument.signature(of: tool).hasSuffix("()"), "\(tool.name) rendered empty")
             }
         }
+    }
+
+    @Test("Across a real toolset the index is much cheaper than the prose")
+    func theIndexBeatsTheProseAcrossManyToolsets() async throws {
+        // The claim the feature rests on, measured where it applies: the section is a fixed cost, the
+        // per-toolset guidance is not, so the saving grows with the number of auxiliary toolsets. (With
+        // exactly one, it loses - see `theSectionIsAFixedCost`.)
+        let (auxiliaryAgent, auxiliaryRecorder) = makeAgent()
+        _ = await auxiliaryAgent.run([.human("hi")]) { _ in }
+        let lazy = try #require(await auxiliaryRecorder.systemPrompts.first.flatMap { $0 })
+
+        let eagerRecorder = RunRecorder()
+        let root = WorkspaceRoot(rootURL: URL(fileURLWithPath: "/tmp"))
+        let eagerAgent = createDeepAgent(
+            model: FakeChatModel(answer: "hi"),
+            tools: [SchemaOnlyTool()],
+            middleware: [
+                WebToolsMiddleware(), SearchToolsMiddleware(root: root), TextToolsMiddleware(root: root),
+                GitToolsMiddleware(root: root), ShellToolsMiddleware(root: root),
+                ClipboardMiddleware(), AppleNotesMiddleware(), ScreenshotMiddleware(),
+                MacToolsMiddleware(root: root),
+                RequestRecordingMiddleware(recorder: eagerRecorder)
+            ],
+            includeGeneralPurpose: false,
+            summarization: nil
+        )
+        _ = await eagerAgent.run([.human("hi")]) { _ in }
+        let eager = try #require(await eagerRecorder.systemPrompts.first.flatMap { $0 })
+
+        #expect(lazy.count < eager.count / 2, "lazy \(lazy.count) chars vs eager \(eager.count)")
     }
 
     @Test("A call built from the signature alone passes schema validation")
