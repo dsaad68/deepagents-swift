@@ -154,7 +154,7 @@ The following toolsets ship in DeepAgents. Each toolset is owned by a middleware
 | ID | Middleware | Tools |
 |---|---|---|
 | `web` | `WebToolsMiddleware` | `fetch`, `curl` |
-| `search` | `SearchToolsMiddleware` | `grep`, `glob`, `tree` |
+| `search` | `SearchToolsMiddleware` | `grep`, `glob`, `tree` (see [walk limits](#search-walk-limits)) |
 | `text` | `TextToolsMiddleware` | `head`, `tail`, `diff` |
 | `git` | `GitToolsMiddleware` | `git_status`, `git_diff`, `git_log`, `git_show`, `git_blame` |
 | `shell` | `ShellToolsMiddleware` | `shell` |
@@ -222,6 +222,36 @@ When you pass `disabledToolNames:` to `createAgent` / `createDeepAgent`, or expa
 | `ToolApprovalMode.ask` | Dispatch time (wrapToolCall) | Yes - pending user confirmation |
 
 Prefer disabling at factory time for tools that should never be available in a given context (e.g. no filesystem writes in a read-only agent). Use `ask` / `deny` approval modes for tools that should be available but audited or constrained at runtime.
+
+---
+
+## Search walk limits
+
+`grep`, `glob` and `tree` share one file walk, with two limits worth knowing about.
+
+**Build output is skipped.** `build`, `DerivedData`, `node_modules`, `Pods`, `Carthage` and
+`__pycache__` are never descended into. They are generated, routinely far larger than the source
+they came from, and never what a search is looking for - in the Mispher repo, `Ripple/build` is
+23,288 files, 96% of everything under the root. `tree` names such a folder rather than descending
+it, so the layout stays honest.
+
+The list is deliberately short and excludes names that plausibly hold real sources (`target`,
+`dist`, `site`, `vendor`). A wrongly skipped directory is a search that confidently misses
+something real - the same defect as the one below, from the other direction.
+
+**A truncated walk says so.** The walk stops after `FileWalk.maxFiles` (20,000). When it does, the
+tools report that they searched the first N files and stopped, rather than "No matches":
+
+```
+Searched the first 20000 files under "." and found no match for /pattern/, then stopped -
+the folder holds more than that, so the pattern may still be present in what was not
+searched. Narrow it with `path` or `include`.
+```
+
+This matters more than the cap itself. Reporting a truncated search as an absence gives the model a
+false fact it cannot detect, and it will act on it - in one measured case, spending 18 rounds trying
+to reconcile "no matches" with a question that presumed the symbol existed. A partial result that
+admits it is partial costs a follow-up call; a wrong one costs the whole turn.
 
 ---
 

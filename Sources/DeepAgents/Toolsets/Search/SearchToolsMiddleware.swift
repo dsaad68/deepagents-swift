@@ -72,7 +72,8 @@ public struct GrepTool: AgentTool {
 
         var results: [String] = []
         var truncated = false
-        for file in FileWalk.files(under: base) {
+        let walk = FileWalk.files(under: base)
+        for file in walk.files {
             if let include, !include.matches(file.lastPathComponent) { continue }
             guard let content = FileWalk.readText(file) else { continue }
             let relPath = root.relativePath(file)
@@ -87,10 +88,23 @@ public struct GrepTool: AgentTool {
             if results.count >= Self.maxResults { truncated = true; break }
         }
         if results.isEmpty {
+            // An unsearched folder is not an empty one. Saying "no matches" after the walk gave up
+            // reports an absence that was never established, and the caller cannot tell.
+            guard !walk.truncated else {
+                return ToolOutput(
+                    "Searched the first \(FileWalk.maxFiles) files under "
+                        + "\"\(root.relativePath(base))\" and found no match for /\(pattern)/, then "
+                        + "stopped - the folder holds more than that, so the pattern may still be "
+                        + "present in what was not searched. Narrow it with `path` or `include`."
+                )
+            }
             return ToolOutput("No matches for /\(pattern)/ under \"\(root.relativePath(base))\".")
         }
         var output = results.joined(separator: "\n")
         if truncated { output += "\n… (stopped at \(Self.maxResults) matches)" }
+        if walk.truncated {
+            output += "\n… (only the first \(FileWalk.maxFiles) files were searched; there may be more)"
+        }
         return ToolOutput(output)
     }
 }
@@ -129,13 +143,29 @@ public struct GlobTool: AgentTool {
         let glob = GlobPattern(pattern)
         let matchPath = pattern.contains("/")
         var matches: [String] = []
-        for file in FileWalk.files(under: base) {
+        let walk = FileWalk.files(under: base)
+        for file in walk.files {
             let candidate = matchPath ? FileWalk.relativePath(of: file, under: base) : file.lastPathComponent
             if glob.matches(candidate) { matches.append(root.relativePath(file)) }
             if matches.count >= Self.maxResults { break }
         }
-        if matches.isEmpty { return ToolOutput("No files match \"\(pattern)\".") }
-        return ToolOutput(matches.sorted().joined(separator: "\n"))
+        if matches.isEmpty {
+            // Same trap as `grep`: a walk that gave up early has established nothing.
+            guard !walk.truncated else {
+                return ToolOutput(
+                    "Searched the first \(FileWalk.maxFiles) files under "
+                        + "\"\(root.relativePath(base))\" and found nothing matching \"\(pattern)\", "
+                        + "then stopped - the folder holds more than that, so a match may still "
+                        + "exist in what was not searched. Narrow it with `path`."
+                )
+            }
+            return ToolOutput("No files match \"\(pattern)\".")
+        }
+        var output = matches.sorted().joined(separator: "\n")
+        if walk.truncated {
+            output += "\n… (only the first \(FileWalk.maxFiles) files were searched; there may be more)"
+        }
+        return ToolOutput(output)
     }
 }
 
@@ -184,8 +214,11 @@ public struct TreeTool: AgentTool {
                 if count >= Self.maxEntries { truncated = true; return }
                 count += 1
                 let isDir = (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
-                lines.append("\(prefix)\(entry.lastPathComponent)\(isDir ? "/" : "")")
-                if isDir { walk(entry, prefix: prefix + "  ", depth: depth + 1) }
+                let skipped = isDir && FileWalk.skippedDirectories.contains(entry.lastPathComponent)
+                // Named, but not descended into: a layout is more readable without thousands of
+                // generated files, and saying it was skipped beats appearing to be empty.
+                lines.append("\(prefix)\(entry.lastPathComponent)\(isDir ? "/" : "")\(skipped ? "  (build output, not listed)" : "")")
+                if isDir, !skipped { walk(entry, prefix: prefix + "  ", depth: depth + 1) }
             }
         }
         walk(base, prefix: "  ", depth: 1)
@@ -199,27 +232,58 @@ public struct TreeTool: AgentTool {
 /// File-tree walking shared by the search tools, with hard caps so a giant tree can't run
 /// unbounded or read oversized/binary files into the conversation.
 enum FileWalk {
-    static let maxFiles = 5000
+    static let maxFiles = 20000
     static let maxFileBytes = LocalFilesystemBackend.maxReadBytes
 
-    /// Regular files under `base` (or `base` itself when it's a file), skipping hidden files,
-    /// capped at `maxFiles`.
-    static func files(under base: URL) -> [URL] {
+    /// Directory names never descended into: build output and vendored dependencies. They are
+    /// generated, routinely far larger than the source they came from, and never what a search is
+    /// looking for. Measured on this repo, `Ripple/build` is 23,288 files - 96% of everything -
+    /// and a walk starting at the root spent its entire budget inside it without reaching a single
+    /// source file.
+    ///
+    /// Deliberately short and unambiguous. Over-skipping reintroduces the same bug from the other
+    /// direction: a directory wrongly skipped is still a search that reports "not found" for
+    /// something that is there. Names that plausibly hold real sources (`target`, `dist`, `site`,
+    /// `vendor`) are left in for that reason - the cap plus honest truncation reporting is the
+    /// backstop, not this list.
+    static let skippedDirectories: Set<String> = [
+        "build", "DerivedData", "node_modules", "Pods", "Carthage", "__pycache__"
+    ]
+
+    /// What a walk found, and whether the cap cut it short.
+    ///
+    /// `truncated` is the point of this type. A caller that reports "no matches" after a truncated
+    /// walk states something it never checked, and neither the user nor a model can tell the
+    /// difference - which is exactly how `grep` came to report that a symbol sitting in this repo
+    /// did not exist.
+    struct Walk {
+        let files: [URL]
+        let truncated: Bool
+    }
+
+    /// Regular files under `base` (or `base` itself when it's a file), skipping hidden files and
+    /// ``skippedDirectories``, capped at ``maxFiles``.
+    static func files(under base: URL) -> Walk {
         var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: base.path, isDirectory: &isDirectory) else { return [] }
-        if !isDirectory.boolValue { return [base] }
+        guard FileManager.default.fileExists(atPath: base.path, isDirectory: &isDirectory) else {
+            return Walk(files: [], truncated: false)
+        }
+        if !isDirectory.boolValue { return Walk(files: [base], truncated: false) }
         guard let enumerator = FileManager.default.enumerator(
-            at: base, includingPropertiesForKeys: [.isRegularFileKey],
+            at: base, includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey],
             options: [.skipsHiddenFiles, .skipsPackageDescendants]
-        ) else { return [] }
+        ) else { return Walk(files: [], truncated: false) }
         var result: [URL] = []
         for case let url as URL in enumerator {
-            if (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true {
-                result.append(url)
+            let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey])
+            if values?.isDirectory == true, skippedDirectories.contains(url.lastPathComponent) {
+                enumerator.skipDescendants()
+                continue
             }
-            if result.count >= maxFiles { break }
+            if values?.isRegularFile == true { result.append(url) }
+            if result.count >= maxFiles { return Walk(files: result, truncated: true) }
         }
-        return result
+        return Walk(files: result, truncated: false)
     }
 
     /// Read `url` as UTF-8 text, skipping files too large or not decodable (likely binary).
