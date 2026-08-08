@@ -247,6 +247,18 @@ struct EchoTool: AgentTool {
     }
 }
 
+/// A no-op tool with a chosen name — used to test name resolution.
+struct StubNamedTool: AgentTool {
+    let name: String
+    init(_ name: String) { self.name = name }
+    var description: String { "stub" }
+    func execute(
+        _ arguments: [String: AgentJSON], _ context: ToolContext
+    ) async throws -> ToolOutput {
+        ToolOutput("ok")
+    }
+}
+
 /// A tool that always throws — used to test the dispatcher's error recovery.
 struct FailingTool: AgentTool {
     struct Boom: Error {}

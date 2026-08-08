@@ -154,9 +154,32 @@ learns where the stable prefix ends - to establish a base on a config's first si
 deepen a shared one. Hosts can switch the store off at runtime via
 `PrefixKVStore.isEnabledOverride` (ripple exposes this as the **Prefill cache** toggle in
 `/config`, persisted as `prefixKVCache` in `settings.json`); the `DEEPAGENTS_PREFIX_KV=0` env kill
-switch and `DEEPAGENTS_PREFIX_KV_DIR` relocation also apply. The store keeps the 6 most recently
-used snapshots (plus 16 traces) and drops corrupt or stale files silently (they are an
-optimization, never a dependency).
+switch and `DEEPAGENTS_PREFIX_KV_DIR` relocation also apply. Corrupt or stale files are dropped
+silently (they are an optimization, never a dependency).
+
+### Bounding the store
+
+Two limits, because one cannot do the job alone. `PrefixKVStore.maxSnapshotsPerModel` (default 6)
+keeps each model's newest N bases, so a model used constantly cannot evict the warm base of one
+used rarely - the previous global count did exactly that, leaving both cold when a host alternated
+between two models. `PrefixKVStore.maxTotalBytes` (default 4 GB, `0` for no cap) then bounds the
+directory as a whole, because per-model counts say nothing about bytes: one 2.6B base measures
+around 260 MB. Pruning applies them in that order and never evicts the newest snapshot, since a cap
+smaller than a single base would otherwise mean writing and deleting it on every turn. Traces are
+bounded separately at 16 files of tens of KB and are not counted against the byte cap.
+
+### Showing and reclaiming the space
+
+`PrefixKVStore.inventory(directory:knownModelIDs:)` returns what the store holds, grouped by model
+with per-model and total byte counts, for a host that wants to show disk use.
+`PrefixKVStore.removeAll(modelID:)` and `removeAll()` delete a model's artifacts or the whole
+store, and `pruneNow()` applies the current limits immediately rather than at the next save.
+
+These three deliberately ignore the enabled flag: switching the cache off stops it writing, and
+must not strand the hundreds of MB already on disk. The scan is read-only and reads safetensors
+*headers* only, never tensor data. Artifacts are attributed to a model by the `model` key in that
+header (and, for traces, in the payload) - never by parsing the file name, which flattens `/` to
+`--` and can leave one model id prefixing another.
 
 ## MlxModelLoader
 

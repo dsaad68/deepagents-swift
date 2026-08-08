@@ -32,12 +32,33 @@ public enum PrefixKVStore {
     /// settings). Takes precedence over the env kill switch; `nil` defers to it. Lock-guarded:
     /// set from the UI thread, read from the model containers' threads.
     public static var isEnabledOverride: Bool? {
-        get { overrideLock.withLock { overrideStorage } }
-        set { overrideLock.withLock { overrideStorage = newValue } }
+        get { configLock.withLock { overrideStorage } }
+        set { configLock.withLock { overrideStorage = newValue } }
     }
 
-    private static let overrideLock = NSLock()
+    /// Base snapshots kept **per model** after a save - pass 1 of ``prune(_:)``. A model can never
+    /// evict another model's warm base, so alternating between two models no longer leaves both
+    /// cold. Values below 1 clamp to 1: a store that keeps nothing would re-prefill every turn.
+    ///
+    /// Per-model counts say nothing about bytes (one 2.6B base measured 260 MB), which is what
+    /// ``maxTotalBytes`` is for. Lock-guarded alongside the other limits.
+    public static var maxSnapshotsPerModel: Int {
+        get { configLock.withLock { snapshotsPerModelStorage } }
+        set { configLock.withLock { snapshotsPerModelStorage = max(1, newValue) } }
+    }
+
+    /// Ceiling on the total bytes of stored base snapshots - pass 2 of ``prune(_:)``. `0` (or any
+    /// negative value) means no cap. Traces are excluded: they are bounded at ``maxTraces`` files
+    /// of tens of KB, against snapshots measured in hundreds of MB.
+    public static var maxTotalBytes: Int64 {
+        get { configLock.withLock { totalBytesStorage } }
+        set { configLock.withLock { totalBytesStorage = max(0, newValue) } }
+    }
+
+    private static let configLock = NSLock()
     private nonisolated(unsafe) static var overrideStorage: Bool?
+    private nonisolated(unsafe) static var snapshotsPerModelStorage = 6
+    private nonisolated(unsafe) static var totalBytesStorage: Int64 = 4 << 30
 
     /// Whether the store reads/writes disk: the runtime override when set, else the
     /// `DEEPAGENTS_PREFIX_KV=0` env kill switch. In-memory prefix caching is unaffected.
@@ -46,7 +67,9 @@ public enum PrefixKVStore {
     }
 
     /// Where snapshots live: `$DEEPAGENTS_PREFIX_KV_DIR`, else `~/.cache/deepagents/prefix-kv`.
-    static var defaultDirectory: URL {
+    /// Public so a host can show the path, and because it is the default argument of every
+    /// inventory and removal entry point below.
+    public static var defaultDirectory: URL {
         if let dir = ProcessInfo.processInfo.environment["DEEPAGENTS_PREFIX_KV_DIR"], !dir.isEmpty {
             return URL(fileURLWithPath: dir, isDirectory: true)
         }
@@ -54,10 +77,6 @@ public enum PrefixKVStore {
             .appendingPathComponent(".cache/deepagents/prefix-kv", isDirectory: true)
     }
 
-    /// Most-recently-used base snapshots kept after a save; the rest (other models / dead
-    /// configs) are pruned so the directory stays bounded (a 9B model's base is a few hundred
-    /// MB). Loading a base refreshes its position.
-    private static let maxSnapshots = 6
     /// Format version stamped into (and required from) every artifact. v2: bases went from
     /// fingerprint-keyed to content-addressed; v1 files are deleted on sight and re-warm.
     private static let version = "2"
@@ -246,14 +265,18 @@ public enum PrefixKVStore {
     ) {
         guard isEnabled, !tokens.isEmpty else { return }
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        // `model` is additive - `loadTrace` must never require it, or every trace already on a
+        // user's disk would orphan. It exists so a trace can be attributed to its model without
+        // guessing from the file name (see `owner(of:knownModelIDs:)`).
         let payload: [String: String] = [
             "version": version,
+            "model": modelID,
             "revision": revisionOnDisk(modelID) ?? "unknown",
             "tokens": tokens.map(String.init).joined(separator: ",")
         ]
         guard let data = try? JSONEncoder().encode(payload) else { return }
         try? data.write(to: traceURL(modelID, fingerprint, directory), options: .atomic)
-        prune(directory)
+        pruneTraces(directory)
     }
 
     /// The traced prompt tokens for (model, fingerprint), or nil when absent / stale.
@@ -281,6 +304,166 @@ public enum PrefixKVStore {
         return trimmed.isEmpty ? nil : trimmed
     }
 
+    // MARK: - Inventory and removal
+
+    //
+    // Everything in this section deliberately ignores ``isEnabled``. Turning the store off stops
+    // it *writing*; it does not make the hundreds of MB already on disk someone else's problem.
+    // A host has to be able to show and reclaim that space either way.
+
+    /// What one model occupies in the store.
+    public struct ModelUsage: Sendable, Identifiable, Equatable {
+        public let modelID: String
+        public let snapshotCount: Int
+        public let snapshotBytes: Int64
+        public let traceCount: Int
+        public let traceBytes: Int64
+
+        public var bytes: Int64 { snapshotBytes + traceBytes }
+        public var id: String { modelID }
+
+        public init(
+            modelID: String, snapshotCount: Int, snapshotBytes: Int64,
+            traceCount: Int, traceBytes: Int64
+        ) {
+            self.modelID = modelID
+            self.snapshotCount = snapshotCount
+            self.snapshotBytes = snapshotBytes
+            self.traceCount = traceCount
+            self.traceBytes = traceBytes
+        }
+    }
+
+    /// Everything the store holds, grouped by model.
+    public struct Inventory: Sendable, Equatable {
+        public let directory: URL
+        /// Per model, largest first.
+        public let models: [ModelUsage]
+        /// Files that name no model - an unreadable header, or a trace from an older build for a
+        /// model no longer in the catalog. Reported so the totals add up, never deleted implicitly.
+        public let unattributedCount: Int
+        public let unattributedBytes: Int64
+
+        public var totalBytes: Int64 { models.reduce(0) { $0 + $1.bytes } + unattributedBytes }
+
+        public init(
+            directory: URL, models: [ModelUsage], unattributedCount: Int, unattributedBytes: Int64
+        ) {
+            self.directory = directory
+            self.models = models
+            self.unattributedCount = unattributedCount
+            self.unattributedBytes = unattributedBytes
+        }
+
+        public static let empty = Inventory(
+            directory: PrefixKVStore.defaultDirectory, models: [],
+            unattributedCount: 0, unattributedBytes: 0
+        )
+    }
+
+    /// Scan the store and group it by model.
+    ///
+    /// Reads safetensors *headers* only - never tensor data - so it stays cheap on a multi-GB
+    /// directory. Strictly read-only, unlike ``baseCandidates(modelID:directory:)``, which deletes
+    /// what it cannot parse: a scan that quietly ate files while the user was looking at them
+    /// would be indefensible. Blocking file I/O; call it off the main thread.
+    public static func inventory(
+        directory: URL = defaultDirectory,
+        knownModelIDs: [String] = MlxModel.catalog.map(\.id)
+    ) -> Inventory {
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: [.fileSizeKey]
+        ) else { return Inventory(directory: directory, models: [], unattributedCount: 0, unattributedBytes: 0) }
+
+        var snapshots: [String: (count: Int, bytes: Int64)] = [:]
+        var traces: [String: (count: Int, bytes: Int64)] = [:]
+        var unattributedCount = 0
+        var unattributedBytes: Int64 = 0
+
+        for url in files {
+            let isSnapshot = url.pathExtension == "safetensors"
+            guard isSnapshot || url.pathExtension == "json" else { continue }
+            let bytes = fileSize(url)
+            guard let model = owner(of: url, knownModelIDs: knownModelIDs) else {
+                unattributedCount += 1
+                unattributedBytes += bytes
+                continue
+            }
+            if isSnapshot {
+                let entry = snapshots[model, default: (0, 0)]
+                snapshots[model] = (entry.count + 1, entry.bytes + bytes)
+            } else {
+                let entry = traces[model, default: (0, 0)]
+                traces[model] = (entry.count + 1, entry.bytes + bytes)
+            }
+        }
+
+        var names: Set<String> = Set(snapshots.keys)
+        names.formUnion(traces.keys)
+        var models: [ModelUsage] = []
+        for name in names {
+            let snapshot = snapshots[name] ?? (count: 0, bytes: Int64(0))
+            let trace = traces[name] ?? (count: 0, bytes: Int64(0))
+            models.append(ModelUsage(
+                modelID: name,
+                snapshotCount: snapshot.count, snapshotBytes: snapshot.bytes,
+                traceCount: trace.count, traceBytes: trace.bytes
+            ))
+        }
+        // Largest first: the point of the listing is reclaiming space.
+        models.sort { $0.bytes == $1.bytes ? $0.modelID < $1.modelID : $0.bytes > $1.bytes }
+
+        return Inventory(
+            directory: directory, models: models,
+            unattributedCount: unattributedCount, unattributedBytes: unattributedBytes
+        )
+    }
+
+    /// Delete every artifact belonging to `modelID` - bases and traces alike. Returns bytes freed.
+    @discardableResult
+    public static func removeAll(
+        modelID: String,
+        directory: URL = defaultDirectory,
+        knownModelIDs: [String] = MlxModel.catalog.map(\.id)
+    ) -> Int64 {
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: [.fileSizeKey]
+        ) else { return 0 }
+        var freed: Int64 = 0
+        for url in files where url.pathExtension == "safetensors" || url.pathExtension == "json" {
+            guard owner(of: url, knownModelIDs: knownModelIDs) == modelID else { continue }
+            let bytes = fileSize(url)
+            if (try? fm.removeItem(at: url)) != nil { freed += bytes }
+        }
+        return freed
+    }
+
+    /// Empty the store, leaving the directory itself in place. Returns bytes freed.
+    @discardableResult
+    public static func removeAll(directory: URL = defaultDirectory) -> Int64 {
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: [.fileSizeKey]
+        ) else { return 0 }
+        var freed: Int64 = 0
+        for url in files where url.pathExtension == "safetensors" || url.pathExtension == "json" {
+            let bytes = fileSize(url)
+            if (try? fm.removeItem(at: url)) != nil { freed += bytes }
+        }
+        return freed
+    }
+
+    /// Apply the current limits now, rather than at the next save - what a host calls after the
+    /// user lowers ``maxSnapshotsPerModel`` or ``maxTotalBytes``, so the space comes back while
+    /// they are still looking at the setting.
+    public static func pruneNow(directory: URL = defaultDirectory) {
+        prune(directory)
+    }
+
+    // MARK: - Internals
+
     /// The *user* metadata of a saved prompt cache, read from the safetensors header without
     /// loading any tensor data (and without MLX, so the candidate scan stays cheap and
     /// unit-testable). Layout: 8-byte little-endian header length, then a JSON object carrying
@@ -307,6 +490,34 @@ public enum PrefixKVStore {
 
     private static func flatID(_ modelID: String) -> String {
         modelID.replacingOccurrences(of: "/", with: "--")
+    }
+
+    /// The model a stored artifact belongs to, or `nil` when nothing identifies it.
+    ///
+    /// Never parses the file name. ``flatID(_:)`` maps `/` to `--` and the name then carries a
+    /// trailing `-<hex>`, so it cannot be split back without a candidate list - and one model id
+    /// can prefix another, the same hazard ``baseCandidates(modelID:directory:)`` already guards
+    /// against by comparing the header's `model` key. A base is identified by that key; a trace by
+    /// the matching key in its payload, falling back for traces written before that key existed to
+    /// the *longest* known id whose `flatID` prefixes the name (longest, so a shorter id can never
+    /// claim a longer sibling's files).
+    static func owner(of url: URL, knownModelIDs: [String]) -> String? {
+        switch url.pathExtension {
+        case "safetensors":
+            return headerMetadata(url: url)?["model"]
+        case "json":
+            if let data = try? Data(contentsOf: url),
+               let payload = try? JSONDecoder().decode([String: String].self, from: data),
+               let model = payload["model"] {
+                return model
+            }
+            let name = url.lastPathComponent
+            return knownModelIDs
+                .filter { name.hasPrefix("\(flatID($0))-") }
+                .max { $0.count < $1.count }
+        default:
+            return nil
+        }
     }
 
     private static func traceURL(_ modelID: String, _ fingerprint: Int, _ directory: URL) -> URL {
@@ -350,23 +561,92 @@ public enum PrefixKVStore {
     /// Traces kept per directory - tiny files, bounded anyway so dead configs don't accumulate.
     private static let maxTraces = 16
 
-    /// Keep the ``maxSnapshots`` most-recently-used base files (each can be a few hundred MB)
-    /// and the ``maxTraces`` most-recently-written traces.
-    private static func prune(_ directory: URL) {
+    /// Keep the ``maxTraces`` most-recently-written traces. Split out from ``prune(_:)`` because
+    /// ``saveTrace(tokens:modelID:fingerprint:directory:)`` runs after *every* turn, and must not
+    /// pay for a header read of every multi-hundred-MB snapshot to re-bound a set of files only
+    /// ``saveBase(cache:tokens:modelID:directory:)`` can grow.
+    private static func pruneTraces(_ directory: URL) {
         let fm = FileManager.default
         guard let files = try? fm.contentsOfDirectory(
             at: directory, includingPropertiesForKeys: [.contentModificationDateKey]
         ) else { return }
-        let snapshots = files.filter { $0.pathExtension == "safetensors" }
-            .sorted { modified($0) > modified($1) }
-        for stale in snapshots.dropFirst(maxSnapshots) { try? fm.removeItem(at: stale) }
         let traces = files.filter { $0.pathExtension == "json" }
             .sorted { modified($0) > modified($1) }
         for stale in traces.dropFirst(maxTraces) { try? fm.removeItem(at: stale) }
     }
 
+    /// One base snapshot as ``prune(_:)`` sees it: where it lives, whose it is, and the two facts
+    /// the passes sort and budget on.
+    private struct StoredSnapshot {
+        let url: URL
+        let owner: String?
+        let bytes: Int64
+        let modified: Date
+    }
+
+    /// Bound the store, in two passes over the base snapshots (plus the traces).
+    ///
+    /// Pass 1 keeps the newest ``maxSnapshotsPerModel`` of *each* model, so a model that is used
+    /// constantly cannot evict the warm base of one that is used rarely. Pass 2 then bounds the
+    /// directory as a whole against ``maxTotalBytes``, because per-model counts say nothing about
+    /// bytes - the two limits do different jobs and both are needed.
+    ///
+    /// Ordering is by modification date descending, which is most-recently-*used*, not merely
+    /// most-recently-written: ``seed(modelID:fingerprint:promptTokens:directory:)`` touches a base
+    /// it resumes from and ``saveBase(cache:tokens:modelID:directory:)`` touches one it skipped
+    /// rewriting, so recency tracks usefulness.
+    private static func prune(_ directory: URL, knownModelIDs: [String] = MlxModel.catalog.map(\.id)) {
+        pruneTraces(directory)
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey]
+        ) else { return }
+        var snapshots: [StoredSnapshot] = []
+        for url in files where url.pathExtension == "safetensors" {
+            snapshots.append(StoredSnapshot(
+                url: url, owner: owner(of: url, knownModelIDs: knownModelIDs),
+                bytes: fileSize(url), modified: modified(url)
+            ))
+        }
+        snapshots.sort { $0.modified > $1.modified }
+
+        // Pass 1 - per-model budget. A snapshot whose header won't read groups under its own file
+        // name: a budget of one, so a corrupt file can never consume a real model's allowance,
+        // and pass 2 can still reclaim it.
+        let limit = maxSnapshotsPerModel
+        var kept: [String: Int] = [:]
+        var survivors: [(url: URL, bytes: Int64)] = []
+        for snapshot in snapshots {
+            let key = snapshot.owner ?? snapshot.url.lastPathComponent
+            let count = kept[key, default: 0]
+            if count < limit {
+                kept[key] = count + 1
+                survivors.append((snapshot.url, snapshot.bytes))
+            } else {
+                try? fm.removeItem(at: snapshot.url)
+            }
+        }
+
+        // Pass 2 - byte ceiling, oldest first. The newest snapshot is exempt: it is the base this
+        // run just wrote or just resumed from, and evicting it under a cap smaller than one base
+        // would re-prefill and rewrite it every single turn.
+        let cap = maxTotalBytes
+        guard cap > 0, survivors.count > 1 else { return }
+        var total = survivors.reduce(Int64(0)) { $0 + $1.bytes }
+        var index = survivors.count - 1
+        while total > cap, index > 0 {
+            try? fm.removeItem(at: survivors[index].url)
+            total -= survivors[index].bytes
+            index -= 1
+        }
+    }
+
     private static func modified(_ url: URL) -> Date {
         (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
             .contentModificationDate ?? .distantPast
+    }
+
+    private static func fileSize(_ url: URL) -> Int64 {
+        Int64((try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
     }
 }

@@ -100,6 +100,52 @@ Tools from an MCP server are namespaced by prepending the server name and a doub
 
 For example, a server named `filesystem` with a tool named `read_file` becomes `filesystem__read_file` in the agent's tool set. This prevents name collisions across servers and makes it clear in the conversation history which server handled each call.
 
+Both halves are put through `ToolName.normalized`, so the published name is always `[a-z0-9_]`. See [One spelling per tool](#one-spelling-per-tool) below - it applies to every tool, not just MCP ones.
+
+Two servers whose names normalize to the same prefix (`parallel-search` and `parallel_search` both give `parallel_search__`) would otherwise contribute colliding tool names; the loader keeps both reachable by appending a numeric suffix to the later one (`server__tool_2`).
+
+## One spelling per tool
+
+`ToolName.normalized` is the single rule for what a tool is called, and it runs in **both** directions:
+
+- **On the way out**, a tool's name is published to the model through it.
+- **On the way in**, every name the model emits is put through it as the message enters the agent loop, and the call is renamed to the matching tool's own spelling.
+
+```swift
+ToolName.normalized("parallel-search__web_search")  // "parallel_search__web_search"
+ToolName.normalized("Read File")                    // "read_file"
+```
+
+The rule: ASCII letters, digits and `_` survive (lowercased); everything else becomes `_`. Models are trained on `[A-Za-z0-9_]` function names and normalize other punctuation away when emitting a call, so a name outside that set cannot round-trip.
+
+Because both ends share one function, there is exactly one spelling of a tool inside the loop - which is what lets dispatch stay an exact match, and what guarantees the approval gate, the deny list, the duplicate-round guard and the message log all key on the same name. A call that matches no tool keeps the model's spelling, so the unknown-tool error quotes what was actually emitted.
+
+!!! note "Why it matters that this is one rule and not two"
+    Enforcing the convention only on the way out is what made a hyphenated server unreachable: it published `parallel_search__web_search`, the model emitted `parallel-search__web_search`, and dispatch answered "unknown tool". Papering over that with a second, more forgiving match *at dispatch* then let a call reach the middleware chain under a name the approval gate did not recognise - running an `.ask` (or `.deny`) tool with no prompt at all.
+
+## Attributing a tool to its server
+
+To ask which server contributed a tool, use `toolsFromServer(_:in:)` - never the dispatch-name prefix:
+
+```swift
+let searchTools = toolsFromServer("parallel-search", in: agent.tools)
+```
+
+Attribution reads the server off the tool itself, through the `ServerScopedTool` protocol:
+
+```swift
+public protocol ServerScopedTool: AgentTool {
+    /// The contributing server, exactly as configured (unsanitized).
+    var serverName: String { get }
+    /// The tool's own name on that server, without the namespace prefix.
+    var toolName: String { get }
+}
+```
+
+`MCPTool` conforms, exposing `serverName` and `toolName` publicly. Both `mcpApprovalDefaults(servers:tools:)` and `mcpToolsForDisplay(server:in:)` attribute this way, and a host adding its own server-backed tools should conform too.
+
+`MCPTool.dispatchPrefix(forServer:)` still exists for *building* or displaying a name, but must not be used to attribute one: the prefix is normalized, so distinct server names collapse onto a single prefix and the match is ambiguous. Matching on it meant a tool could take a neighbouring server's approval mode - a `.deny` server's tool running as `.approve`.
+
 ## Per-server failure isolation
 
 If a server fails to connect or crashes mid-run, that server's tools become unavailable but all other servers continue operating normally. The failure is logged; the agent does not see an error unless it actually tries to call one of the unavailable tools.

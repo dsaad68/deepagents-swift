@@ -46,6 +46,7 @@ Related adapter pages: [Adapters overview](../adapters/index.md), [MLX](../adapt
 | `AgentToolPolicy` | Declarative policy: disable middleware/tools, set approval modes, configure sandbox |
 | `ToolApprovalMode` | `.approve` / `.ask` / `.deny` |
 | `SandboxMode` | `.off` / `.failover` / `.containerOnly` |
+| `ToolName` | The one spelling rule for a tool name; `normalized(_:)` runs on names published *and* on names the model emits |
 
 ### Middleware
 
@@ -117,7 +118,11 @@ Related adapter pages: [Adapters overview](../adapters/index.md), [MLX](../adapt
 | `MCPMiddleware` | Contributes MCP tools to an agent |
 | `MCPServerConfig` | Config for one server: kind, command/URL, auth, approvalMode |
 | `MCPServerStatus` | Connection state for one server after `load()` |
-| `MCPTool` | `AgentTool` wrapper around a tool discovered from an MCP server |
+| `MCPTool` | `AgentTool` wrapper around a tool discovered from an MCP server; exposes `serverName` and `toolName` |
+| `ServerScopedTool` | Protocol: a tool that names the server which contributed it (`serverName`, `toolName`) |
+| `toolsFromServer(_:in:)` | The one way to attribute tools to a server - never match the dispatch-name prefix |
+| `mcpApprovalDefaults(servers:tools:)` | Maps each MCP tool to its server's approval mode |
+| `mcpToolsForDisplay(server:in:)` | Per-server projection of the live tool set, for a host UI |
 
 ### Networking
 

@@ -28,7 +28,7 @@ Declare the dependency in your `Package.swift`:
         dependencies: [
             .package(
                 url: "https://github.com/dsaad68/deepagents-swift",
-                from: "0.2.3"
+                from: "0.5.0"
             ),
         ],
         targets: [
@@ -48,7 +48,7 @@ Declare the dependency in your `Package.swift`:
 
     1. In Xcode, choose **File > Add Package Dependencies...**
     2. Enter the URL: `https://github.com/dsaad68/deepagents-swift`
-    3. Set the version rule to **Up to Next Major Version** from `0.2.3`.
+    3. Set the version rule to **Up to Next Major Version** from `0.5.0`.
     4. Select the products you need from the list and add them to your target.
 
 ## The 5 library products

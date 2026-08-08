@@ -175,6 +175,74 @@ struct ReactLoopTests {
         #expect(events.finalAnswer == "forced answer")
     }
 
+    @Test func repeatedFailingCallIsToldItFailedRatherThanRedirectedToAResult() async {
+        // The repeated call never produced a result - it failed as an unknown tool. The
+        // redirect must say so: told "its result is in the conversation above", a model
+        // answers from a result that does not exist.
+        let agent = createAgent(
+            model: StuckToolModel(toolName: "ecko", finalAnswer: "forced answer"),
+            tools: [EchoTool()],
+            maxIterations: 10
+        )
+
+        let (ok, events) = await agent.collect([.human("loop")])
+
+        #expect(ok)
+        let failures = events.toolFailures.filter { $0.name == "ecko" }.map(\.error)
+        #expect(failures.first?.contains("Unknown tool") == true)
+        let redirect = failures.count > 1 ? failures[1] : ""
+        #expect(redirect.contains("it failed"))
+        #expect(!redirect.contains("its result is "))
+    }
+
+    @Test func emittedToolNamesAreNormalizedToTheToolsOwnSpelling() {
+        // The name the model sends back goes through the same rule that published it, so one
+        // spelling of a tool exists from the moment the message enters the loop.
+        let tools: [any AgentTool] = [EchoTool(), StubNamedTool("parallel_search__web_search")]
+        func names(_ emitted: [String]) -> [String] {
+            let calls = emitted.map { AgentToolCall(name: $0, arguments: [:]) }
+            return ReactAgent.normalizingToolCallNames(.ai("", toolCalls: calls), tools: tools)
+                .toolCalls.map(\.name)
+        }
+
+        #expect(names(["parallel-search__web_search"]) == ["parallel_search__web_search"])
+        #expect(names(["Echo"]) == ["echo"])
+        #expect(names(["echo"]) == ["echo"])
+        // A call that names nothing keeps the model's spelling, so the error quotes what it wrote.
+        #expect(names(["no_such_tool"]) == ["no_such_tool"])
+        // Every call in a round is normalized, not just the first.
+        #expect(names(["Echo", "parallel-search__web_search"]) == ["echo", "parallel_search__web_search"])
+    }
+
+    @Test func ambiguousToolNamesAreNotGuessedAt() {
+        // Two tools that normalize alike: an exact spelling still wins, and one matching neither
+        // exactly is left alone rather than resolved to either.
+        let tools: [any AgentTool] = [StubNamedTool("a-b__run"), StubNamedTool("a_b__run")]
+        #expect(ToolName.resolve("a_b__run", in: tools)?.name == "a_b__run")
+        #expect(ToolName.resolve("A_B__RUN", in: tools) == nil)
+    }
+
+    @Test func aToolReachedByNameDriftIsStillApprovalGated() async {
+        // The drifted name only selects the tool; dispatch then continues under the canonical
+        // one. `HumanInTheLoopMiddleware` looks its gate up by the name on the request, and deny
+        // enforcement lives inside the handler that lookup guards - so forwarding the model's
+        // spelling would run an "Ask" (or "Deny") tool with no approval at all.
+        let spy = ApprovalSpy()
+        let agent = createAgent(
+            model: StuckToolModel(toolName: "Parallel_Search__Web_Search", finalAnswer: "done"),
+            tools: [StubNamedTool("parallel_search__web_search")],
+            middleware: [HumanInTheLoopMiddleware(
+                interruptOn: ["parallel_search__web_search": InterruptOnConfig()],
+                approvalHandler: spy.handler
+            )],
+            maxIterations: 4
+        )
+
+        _ = await agent.collect([.human("search")])
+
+        #expect(await spy.names == ["parallel_search__web_search"])
+    }
+
     @Test func legitimateRepeatWithDifferentArgumentsIsNotStopped() async {
         let c1 = AgentToolCall(name: "echo", arguments: ["text": .string("one")])
         let c2 = AgentToolCall(name: "echo", arguments: ["text": .string("two")])
@@ -396,5 +464,20 @@ private struct ProbeToolMiddleware: AgentMiddleware {
         let sawAI = request.state.messages.contains { !$0.toolCalls.isEmpty }
         await probe.mark(sawAI)
         return try await handler(request)
+    }
+}
+
+/// Records the tool names the approval gate was actually shown, and rejects every one so a
+/// gated run can't proceed to execute the tool.
+private actor ApprovalSpy {
+    private(set) var names: [String] = []
+
+    private func record(_ request: ToolApprovalRequest) -> ToolApprovalDecision {
+        names.append(request.toolName)
+        return .reject(message: "no")
+    }
+
+    nonisolated var handler: ToolApprovalHandler {
+        { await self.record($0) }
     }
 }

@@ -7,6 +7,76 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-06
+
+### Added
+
+- **The prefix KV store can be inspected and reclaimed.** `PrefixKVStore.inventory(directory:
+  knownModelIDs:)` reports what is on disk grouped by model, with per-model and total byte counts;
+  `removeAll(modelID:)` / `removeAll()` delete a model's artifacts or the whole store; `pruneNow()`
+  applies the current limits immediately instead of at the next save. All three ignore the enabled
+  flag - turning the cache off stops it writing, it does not make the hundreds of MB already
+  written someone else's problem. The scan is read-only and reads safetensors headers only.
+- **`PrefixKVStore.maxTotalBytes`** (default 4 GB, `0` for no cap) bounds the store by size, and
+  `defaultDirectory` is now public so a host can show the path.
+- **`ToolName`** - the single spelling rule for a tool name, applied in both directions.
+  `ToolName.normalized(_:)` maps a name to `[a-z0-9_]`; it is what publishes a tool's name to the
+  model *and* what every emitted name is put through on the way back in.
+- **`ServerScopedTool`** - a tool that names the server which contributed it (`serverName`,
+  `toolName`), plus **`toolsFromServer(_:in:)`** to attribute tools to a server. `MCPTool` conforms
+  and now exposes `serverName`/`toolName` publicly. Hosts contributing their own server-backed
+  tools should conform so approval defaults and per-server UI reach them.
+
+### Changed
+
+- **The snapshot limit is per model, not global.** `maxSnapshots = 6` counted every base in the
+  directory, so alternating between two models evicted each other's warm base and left both cold.
+  `PrefixKVStore.maxSnapshotsPerModel` (default 6, settable) gives each model its own budget. That
+  relaxes the old bound - N models can now keep N x 6 snapshots - which is why `maxTotalBytes`
+  ships alongside it; pruning applies the count first, then the byte ceiling, and never evicts the
+  newest snapshot (a cap below one base size would otherwise write and delete it every turn).
+  Ripple inherits both with no code change.
+- **Artifacts are attributed to a model by metadata, never by file name.** Bases already carried a
+  `model` key in their safetensors header; traces now carry one in their payload. The file name
+  flattens `/` to `--` and can leave one model id prefixing another, so it cannot be parsed back
+  reliably. Traces written before this still load, and are attributed by longest-prefix match.
+- **`saveTrace` no longer prunes snapshots.** It runs after every turn, and the per-model pass has
+  to read a header from every base; it now bounds only the traces it writes.
+- **Published tool names are lowercased.** `ToolName.normalized` folds case as well as punctuation,
+  so an MCP server exposing `getWeather` now dispatches as `server__getweather`. Every built-in
+  tool name was already lowercase, so nothing there moves; a host reading `MCPTool.name` for
+  display should read `toolName` instead, which is unchanged.
+- **`mcpApprovalDefaults(servers:tools:)` only assigns a default to a `ServerScopedTool`.** It
+  previously matched on the dispatch-name prefix, so any tool whose name merely started with
+  `server__` was picked up. A host passing non-MCP tools that followed the convention by hand no
+  longer gets a default for them - they fall to the tool catalog.
+
+### Fixed
+
+- **Tool names are normalized in both directions, so a hyphenated MCP server is reachable.** The
+  naming convention was enforced on egress only: `MCPTool` sanitized the name it published and the
+  name the model sent back was compared raw. A `parallel-search` server therefore exposed
+  `parallel-search__web_search`, the model emitted `parallel_search__web_search` (models normalize
+  punctuation out of a function name), and dispatch answered "unknown tool" - the whole server was
+  unreachable. The rule now lives in one place, `ToolName.normalized`, and every name the model
+  emits goes through it as it enters the loop, renamed to the tool's own spelling. From that line
+  on exactly one spelling of a tool exists, so dispatch is an exact match again and the stored
+  message, the duplicate-round signature, the events, the middleware chain and the approval gate
+  cannot disagree about what was called. Servers are still invoked with their original tool names.
+- **An MCP tool could inherit another server's approval mode.** `mcpApprovalDefaults` and
+  `mcpToolsForDisplay` attributed a tool to a server by its dispatch-name prefix, which is
+  normalized - so `parallel-search` and `parallel_search` both yield `parallel_search__` and every
+  tool under it took whichever mode came last, letting a "Deny" server's tool run as "Approve".
+  Attribution now goes through the new `ServerScopedTool` protocol, which carries the contributing
+  server on the tool itself; `toolsFromServer(_:in:)` is the one way to ask. `MCPTool` conforms and
+  exposes `serverName`/`toolName`. `MCPTool.dispatchPrefix` remains for building a name but must
+  not be used to attribute one.
+- **The duplicate-round guard told the model a failed call had a result.** A call that errored and
+  was re-issued unchanged drew "its result is in the conversation above", so the model answered
+  from a result that never existed (observed: an unfetched web page summarized as fact). A repeat
+  of a round whose calls all failed now gets told the call failed and to fix the name, use another
+  tool, or answer with what it has.
+
 ## [0.4.0] - 2026-08-05
 
 ### Added
@@ -144,6 +214,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Added the `DeepAgentsVersion.current` constant so host front-ends (the Ripple CLI's `--version`,
   the Mispher app's About pane) can report the framework build they were compiled against.
 
+[0.5.0]: https://github.com/dsaad68/deepagents-swift/releases/tag/0.5.0
 [0.4.0]: https://github.com/dsaad68/deepagents-swift/releases/tag/0.4.0
 [0.3.0]: https://github.com/dsaad68/deepagents-swift/releases/tag/0.3.0
 [0.2.3]: https://github.com/dsaad68/deepagents-swift/releases/tag/0.2.3

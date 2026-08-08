@@ -23,11 +23,18 @@ public protocol AgentTool: Sendable {
 
 | Member | Purpose |
 |---|---|
-| `name` | Stable identifier; used for dispatch, disabling, and approval rules |
+| `name` | Stable identifier; used for dispatch, disabling, and approval rules. Normalized to `[a-z0-9_]` - see below |
 | `description` | Natural-language description sent to the model in its tool schema |
 | `parameters` | Typed parameter list; drives JSON schema generation and model guidance |
 | `execute(_:_:)` | Called when the model invokes this tool; receives parsed arguments and context |
 | `toolSchema()` | Returns the JSON schema representation sent to the backend; derived from `parameters` by default |
+
+!!! note "Names are normalized"
+    A tool's `name` is put through `ToolName.normalized` in both directions: it is what the model
+    is shown, and every name the model sends back goes through the same rule before it is matched,
+    so a call finds its tool however the model spelled it. ASCII letters, digits and `_` survive
+    (lowercased); everything else becomes `_`. Pick a name in that alphabet and what you write is
+    what dispatch sees. See [One spelling per tool](mcp.md#one-spelling-per-tool).
 
 !!! tip
     Descriptions matter. The model decides whether to call a tool - and how to fill its arguments - based almost entirely on `description` and the `description` fields of each parameter. Write descriptions as you would a function docstring: state the effect, not the implementation.

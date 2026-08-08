@@ -12,6 +12,26 @@ enum MCPToolError: LocalizedError {
     }
 }
 
+/// A tool contributed by a named server, which therefore has an owner: the server whose
+/// configuration governs it (its approval mode) and under whose heading a UI lists it.
+///
+/// Attribution goes through this protocol and never through the tool's dispatch name. That name
+/// is sanitized, so distinct server names collapse onto one prefix - `parallel-search` and
+/// `parallel_search` both yield `parallel_search__` - and matching on it cannot tell two servers'
+/// tools apart. The consequences are not cosmetic: one server's tools inherit another's approval
+/// mode, so a "Deny" server's tool can execute as "Approve".
+public protocol ServerScopedTool: AgentTool {
+    /// The contributing server, exactly as configured (unsanitized).
+    var serverName: String { get }
+    /// The tool's own name on that server, without the namespace prefix.
+    var toolName: String { get }
+}
+
+/// The tools in `tools` contributed by `serverName` - the one way to attribute a tool to a server.
+public func toolsFromServer(_ serverName: String, in tools: [any AgentTool]) -> [any ServerScopedTool] {
+    tools.compactMap { $0 as? any ServerScopedTool }.filter { $0.serverName == serverName }
+}
+
 /// An `AgentTool` that proxies to a tool on an MCP server — Mispher's analogue of
 /// `langchain-mcp-adapters`' `convert_mcp_tool_to_langchain_tool`.
 ///
@@ -20,11 +40,11 @@ enum MCPToolError: LocalizedError {
 /// server's own JSON Schema is injected verbatim by overriding ``toolSchema()`` — which is
 /// why `AgentTool` declares `toolSchema()` as a requirement, so this override is honored
 /// through the `any AgentTool` existential the model layer iterates.
-public struct MCPTool: AgentTool {
+public struct MCPTool: ServerScopedTool {
     /// Logical server name, used as the tool-name prefix.
-    let serverName: String
+    public let serverName: String
     /// The tool's name on the server (what `callTool` is invoked with).
-    let toolName: String
+    public let toolName: String
     let toolDescription: String
     /// The tool's JSON Schema, as advertised by the server.
     let inputSchema: Value
@@ -34,7 +54,7 @@ public struct MCPTool: AgentTool {
     var nameOverride: String?
 
     /// The namespaced name the model and `ReactAgent` dispatch on. Both components are
-    /// sanitized to `[A-Za-z0-9_-]` because a user-chosen server name (or an unusual
+    /// sanitized to `[A-Za-z0-9_]` because a user-chosen server name (or an unusual
     /// server-side tool name) containing spaces/punctuation may not round-trip through the
     /// chat template and tool-call parser, which would make `ReactAgent`'s exact-match
     /// dispatch fail with "unknown tool". The server is still invoked with the original
@@ -47,22 +67,19 @@ public struct MCPTool: AgentTool {
         "\(sanitize(server))__\(sanitize(tool))"
     }
 
-    /// The dispatch-name prefix (`sanitize(server)__`) every tool a server contributes shares,
-    /// so a caller holding only `[any AgentTool]` can attribute tools back to their server by
-    /// prefix (e.g. to apply that server's approval mode).
+    /// The dispatch-name prefix (`sanitize(server)__`) every tool a server contributes shares.
+    ///
+    /// For building or displaying a name only. Do **not** attribute a tool to a server with it:
+    /// sanitizing maps distinct server names onto one prefix, so the match is ambiguous. Use
+    /// ``toolsFromServer(_:in:)``, which reads the server off the tool.
     public static func dispatchPrefix(forServer server: String) -> String {
         "\(sanitize(server))__"
     }
 
-    /// Map any character outside `[A-Za-z0-9_-]` to `_`; never returns an empty string.
-    static func sanitize(_ component: String) -> String {
-        let mapped = component.map { character -> Character in
-            character.isASCII && (character.isLetter || character.isNumber || character == "_"
-                || character == "-")
-                ? character : "_"
-        }
-        return mapped.isEmpty ? "_" : String(mapped)
-    }
+    /// A server or tool name in the canonical spelling - see ``ToolName/normalized(_:)``, which is
+    /// the same rule applied to the names the model sends back. The server is still invoked with
+    /// the original `toolName` (see `execute`), so normalizing the exposed name is safe.
+    static func sanitize(_ component: String) -> String { ToolName.normalized(component) }
 
     /// Inject the server-provided schema directly, rather than rebuilding it from
     /// `parameters` (which an MCP tool doesn't have) — so nested objects/arrays and every
