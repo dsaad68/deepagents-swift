@@ -88,53 +88,58 @@ public struct ToolSearchMiddleware: AgentMiddleware, ToolRenderFiltering {
         return response
     }
 
-    /// The standing prompt section: the two tiers, the auxiliary tools' **names** grouped by toolset,
-    /// and - the part that actually changes behaviour - when the model is obliged to search.
+    /// The standing prompt section: the two tiers, the **areas** auxiliary tools cover, and - the part
+    /// that actually changes behaviour - when the model is obliged to search.
     ///
-    /// Names, not just toolset labels, because the index is what makes routing work. Asked "which
-    /// Apple Notes tools do you have?", an agent given only "Apple Notes" as a topic has to guess or
-    /// search blindly; given `list_notes, read_note, create_note, update_note` it can answer, and can
-    /// call one straight away (dispatch resolves auxiliary names, so a direct call succeeds - it only
-    /// needs `search_tools` for the argument shapes). The whole index costs ~150 tokens against the
-    /// ~1.5k of per-tool prose it replaces.
+    /// Toolset labels with counts, deliberately **not** tool names. Names were tried and reverted, and
+    /// the reasoning matters because it is easy to re-introduce them:
     ///
-    /// The wording is imperative on purpose. An earlier version described the mechanism only - how to
-    /// call `search_tools`, never when - and a planner read an index of names as reference material
-    /// rather than as an instruction to act: cold, "list my apple notes" produced no search at all,
-    /// while the same request *after* an unrelated search worked, because by then real signatures were
-    /// sitting in the conversation. Two lines carry the fix: the obligation to search before answering,
-    /// and the refusal-block ("never tell the user you cannot…"). The latter restores, tier-agnostically,
-    /// something the per-tool prose used to do - `AppleNotesMiddleware` said "never claim you can't" -
-    /// which was removed with the rest of that prose and left nothing in its place.
+    /// - Discoverability only needs the *area*. The model has to know a notes capability might exist;
+    ///   it does not need to know the tool is spelled `list_notes`. Mapping "list my apple notes" to
+    ///   that name is the retriever's whole job - if the prompt has to do it, ``ColBERTToolRetriever``
+    ///   is decoration.
+    /// - Names cost O(tools); labels cost O(toolsets). The index is the one part of this section that
+    ///   scales, and it scales with exactly the thing lazy loading exists to remove: a fleet of MCP
+    ///   servers with twenty tools apiece would put hundreds of names in every prompt. A "lazy" prompt
+    ///   carrying every tool name is not lazy.
+    /// - It kept the tiers clean. Names in the prompt make the auxiliary tier half-prefilled - a muddy
+    ///   middle rather than "in the prompt" vs "found by searching".
+    ///
+    /// Names were originally added to fix cold `list my apple notes` producing no search. That was the
+    /// wrong fix for that bug: the cause was this section describing the mechanism and never the
+    /// trigger, which the imperative wording below addresses. The names were left behind afterwards as
+    /// redundant compensation.
+    ///
+    /// The wording is imperative on purpose. Two lines carry it: the obligation to search before
+    /// answering, and the refusal-block ("never tell the user you cannot…"). The latter restores,
+    /// tier-agnostically, something the per-tool prose used to do - `AppleNotesMiddleware` said "never
+    /// claim you can't" - which went out with the rest of that prose and left nothing in its place.
     ///
     /// Constant for the life of the run, so it sits inside the cached prefix and never moves the
     /// fingerprint.
     var systemPrompt: String {
         let byToolset = Dictionary(grouping: documents, by: \.toolsetDisplayName)
-        let index = byToolset.keys.sorted().map { toolset in
-            "  \(toolset): " + byToolset[toolset, default: []].map(\.name).sorted().joined(separator: ", ")
-        }
-        .joined(separator: "\n")
+        let areas = byToolset.keys.sorted()
+            .map { "\($0) (\(byToolset[$0]?.count ?? 0))" }
+            .joined(separator: ", ")
         return """
         ## Your tools: core and auxiliary
 
         You have two kinds of tools, and you can use all of them. **Core tools** are the ones whose \
         schemas appear in this request - call them directly. **Auxiliary tools** are equally available \
-        to you, but their schemas are not loaded yet, so you cannot see their parameters. These are \
-        the auxiliary tools you have:
-
-        \(index)
+        to you, but they are not listed here and their schemas are not loaded, so you have to look them \
+        up before you can call them. You have auxiliary tools covering: \(areas).
 
         **If a request needs something your visible tools do not cover, call `search_tools` before you \
         answer.** Describe what you need in a few words ("list notes", "check git history"); it returns \
-        those tools' exact signatures, and you then call the tool by name like any other. One extra \
-        step, then the tool works normally.
+        the matching tools' real names and exact signatures, and you then call one by name like any \
+        other tool. One extra step, then it works normally.
 
-        Never tell the user you are unable to do something that one of the tools listed above does. You \
-        have that tool - you just need its signature first, so search for it and then use it. Do not \
-        invent a tool that appears neither in the list above nor in your own schema. If your output \
-        format will not let you call a tool that is absent from your schema, call `run_tool` with the \
-        tool's name and arguments instead.
+        Never tell the user you are unable to do something that one of the areas above covers - you do \
+        have a tool for it, so search for it and then use it. Never guess a tool's name: the only way \
+        to learn an auxiliary tool's name is `search_tools`. If your output format will not let you \
+        call a tool that is absent from your schema, call `run_tool` with the name and arguments \
+        instead.
         """
     }
 

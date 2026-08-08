@@ -307,14 +307,18 @@ struct ToolSearchGuidanceTests {
         #expect(text.contains("never claim you can't"))
     }
 
-    @Test("Auxiliary tools are still named in the index, grouped by toolset")
-    func indexNamesTheTools() async {
-        // Names are the whole point of the index - without them the agent cannot answer "which Apple
-        // Notes tools do you have?" or call one directly.
+    @Test("The prompt names the auxiliary area, never the tools in it")
+    func indexNamesAreasNotTools() async {
+        // Areas, not names: knowing a notes capability exists is discoverability, and mapping a request
+        // onto `list_notes` is the retriever's job. Names would also cost O(tools) in every prompt -
+        // scaling with exactly what lazy loading exists to remove.
         let text = await prompt(auxiliary: true)
 
         #expect(text.contains("core and auxiliary"))
-        #expect(text.contains("Apple Notes: create_note, list_notes, read_note, update_note"))
+        #expect(text.contains("Apple Notes (4)"))
+        for name in ["list_notes", "read_note", "create_note", "update_note"] {
+            #expect(!text.contains(name), "\(name) should be discoverable only through search_tools")
+        }
     }
 
     @Test("The section tells the model when to search, not just how")
@@ -508,19 +512,37 @@ struct ToolSearchWholeOutputTests {
         }
     }
 
-    @Test("The index names every auxiliary tool exactly once")
-    func indexCoversEveryAuxiliaryTool() async throws {
-        // The other half: withholding the prose must not also withhold the tool's existence, or the
-        // agent cannot know to search for it.
+    @Test("No auxiliary tool's name appears in the prompt at all")
+    func noAuxiliaryToolNameIsInThePrompt() async throws {
+        // Stronger than the backtick check: an auxiliary tool must be reachable *only* through search,
+        // so its name should be absent entirely - not merely absent from instructions.
+        //
+        // Restricted to names containing `_`, which cannot collide with ordinary English. Tool names
+        // that are also words (`open`, `say`, `head`, `diff`, `shell`) would match the surrounding prose
+        // and make this assert nothing; the underscored majority is enough to catch a regression.
         let (agent, recorder) = makeAgent()
         _ = await agent.run([.human("hi")]) { _ in }
         let prompt = try #require(await recorder.systemPrompts.first.flatMap { $0 })
-        let index = try #require(prompt.components(separatedBy: "## Your tools: core and auxiliary").last)
         let auxiliary = Set(agent.tools.map(\.name))
             .subtracting(agent.renderedTools.map(\.name))
+            .filter { $0.contains("_") }
+        #expect(auxiliary.count > 15) // the fixture is doing its job
 
         for name in auxiliary.sorted() {
-            #expect(index.contains(name), "\(name) is hidden but never listed in the index")
+            #expect(!prompt.contains(name), "\(name) is in the prompt; it should require search_tools")
+        }
+    }
+
+    @Test("Every auxiliary area is named, so the agent knows what to search for")
+    func everyAreaIsNamed() async throws {
+        // The other half: withholding the names must not withhold the *existence* of the capability, or
+        // the agent has nothing to search for.
+        let (agent, recorder) = makeAgent()
+        _ = await agent.run([.human("hi")]) { _ in }
+        let prompt = try #require(await recorder.systemPrompts.first.flatMap { $0 })
+
+        for area in ["Apple Notes", "Git", "Web", "Search", "Clipboard", "System"] {
+            #expect(prompt.contains(area), "\(area) is hidden but never mentioned as an area")
         }
     }
 

@@ -61,6 +61,14 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   rejects a wrong value - a wasted round otherwise. Parameters are ordered required-first, then optional
   alphabetically: JSON schema properties arrive unordered, so without a rule the signature (and the
   document text the retriever caches) would differ between runs.
+- **The prompt names auxiliary *areas*, not auxiliary tools.** A brief experiment listed every auxiliary
+  tool's name in the prompt (`Apple Notes: create_note, list_notes, …`); it is gone. Discoverability
+  only needs the area - the model must know a notes capability might exist, not that the tool is spelled
+  `list_notes`, and mapping a request onto that name is the retriever's whole job. Names also cost
+  O(tools) where areas cost O(toolsets), scaling with exactly what lazy loading exists to remove: a
+  fleet of MCP servers at twenty tools apiece would put hundreds of names in every prompt. The section
+  now reads `You have auxiliary tools covering: Apple Notes (4), Clipboard (2), Git (5), Web (2).` and
+  states that `search_tools` is the only way to learn a real name.
 - **The lazy-tools prompt section now says *when* to search, not just how.** It described the mechanism
   only, so a planner read the index of tool names as reference material rather than an instruction:
   cold, "list my apple notes" produced no `search_tools` call at all, while the same request *after* an
