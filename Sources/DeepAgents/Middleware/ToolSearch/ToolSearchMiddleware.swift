@@ -88,56 +88,55 @@ public struct ToolSearchMiddleware: AgentMiddleware, ToolRenderFiltering {
         return response
     }
 
-    /// The standing prompt section: the two tiers, the **areas** auxiliary tools cover, and - the part
-    /// that actually changes behaviour - when the model is obliged to search.
+    /// The standing prompt section: the two tiers, and - the part that actually changes behaviour -
+    /// when the model is obliged to search.
     ///
-    /// Toolset labels with counts, deliberately **not** tool names. Names were tried and reverted, and
-    /// the reasoning matters because it is easy to re-introduce them:
+    /// It names **no capabilities at all**: not tool names, not even toolset labels. Auxiliary tools are
+    /// discovered only through `search_tools`, which is the whole premise of the tier. Two earlier
+    /// versions listed more and both caused harm:
     ///
-    /// - Discoverability only needs the *area*. The model has to know a notes capability might exist;
-    ///   it does not need to know the tool is spelled `list_notes`. Mapping "list my apple notes" to
-    ///   that name is the retriever's whole job - if the prompt has to do it, ``ColBERTToolRetriever``
-    ///   is decoration.
-    /// - Names cost O(tools); labels cost O(toolsets). The index is the one part of this section that
-    ///   scales, and it scales with exactly the thing lazy loading exists to remove: a fleet of MCP
-    ///   servers with twenty tools apiece would put hundreds of names in every prompt. A "lazy" prompt
-    ///   carrying every tool name is not lazy.
-    /// - It kept the tiers clean. Names in the prompt make the auxiliary tier half-prefilled - a muddy
-    ///   middle rather than "in the prompt" vs "found by searching".
+    /// - **Tool names** (`Apple Notes: create_note, list_notes, …`) made the auxiliary tier
+    ///   half-prefilled, cost O(tools) in every prompt - scaling with exactly what lazy loading exists
+    ///   to remove - and did the retriever's job for it. If the prompt maps a request onto a tool name,
+    ///   ``ColBERTToolRetriever`` is decoration.
+    /// - **Toolset labels with counts** (`Apple Notes (4), Clipboard (2)`) were cheaper, O(toolsets),
+    ///   but actively caused the failure documented in `STEPS/ISSUES/tool-search-prompt-echo.md`: the
+    ///   Title-Cased label was the most copyable noun phrase in the section, so the model lifted
+    ///   "Apple Notes" verbatim as its search query and then as a filesystem path
+    ///   (`read_file ~/Apple Notes`). Across five runs of one prompt, every run that wrote a lowercase
+    ///   query succeeded and every run that copied the label failed.
     ///
-    /// Names were originally added to fix cold `list my apple notes` producing no search. That was the
-    /// wrong fix for that bug: the cause was this section describing the mechanism and never the
-    /// trigger, which the imperative wording below addresses. The names were left behind afterwards as
-    /// redundant compensation.
+    /// So the section is now O(1) - constant no matter how many tools or servers exist - and the only
+    /// thing it teaches is the *rule*. The model does not need to know what capabilities exist to know
+    /// it must search when its visible tools do not cover a request, and deriving the query from the
+    /// user's own words is what the retriever is built to handle.
     ///
-    /// The wording is imperative on purpose. Two lines carry it: the obligation to search before
-    /// answering, and the refusal-block ("never tell the user you cannot…"). The latter restores,
-    /// tier-agnostically, something the per-tool prose used to do - `AppleNotesMiddleware` said "never
-    /// claim you can't" - which went out with the rest of that prose and left nothing in its place.
+    /// Three lines carry the behaviour: the obligation to search before answering; the query-shape
+    /// instruction ("the action… not the name of an app, a folder, or a file", which targets the echo
+    /// above); and the refusal-block ("never tell the user you are unable…"). The last restores
+    /// tier-agnostically something the per-tool prose used to do - `AppleNotesMiddleware` said "never
+    /// claim you can't" - which went out with that prose and left nothing in its place.
     ///
     /// Constant for the life of the run, so it sits inside the cached prefix and never moves the
     /// fingerprint.
     var systemPrompt: String {
-        let byToolset = Dictionary(grouping: documents, by: \.toolsetDisplayName)
-        let areas = byToolset.keys.sorted()
-            .map { "\($0) (\(byToolset[$0]?.count ?? 0))" }
-            .joined(separator: ", ")
-        return """
+        """
         ## Your tools: core and auxiliary
 
         You have two kinds of tools, and you can use all of them. **Core tools** are the ones whose \
-        schemas appear in this request - call them directly. **Auxiliary tools** are equally available \
-        to you, but they are not listed here and their schemas are not loaded, so you have to look them \
-        up before you can call them. You have auxiliary tools covering: \(areas).
+        schemas appear in this request - call them directly. You also have **auxiliary tools** that are \
+        not listed here and whose schemas are not loaded: you cannot see their names or their parameters \
+        until you look them up.
 
         **If a request needs something your visible tools do not cover, call `search_tools` before you \
-        answer.** Describe what you need in a few words ("list notes", "check git history"); it returns \
-        the matching tools' real names and exact signatures, and you then call one by name like any \
-        other tool. One extra step, then it works normally.
+        answer.** Describe the action you need in a few lowercase words ("list notes", "check git \
+        history") - not the name of an app, a folder, or a file. It returns the matching tools' real \
+        names and exact signatures, and you then call one by name like any other tool. One extra step, \
+        then it works normally.
 
-        Never tell the user you are unable to do something that one of the areas above covers - you do \
-        have a tool for it, so search for it and then use it. Never guess a tool's name: the only way \
-        to learn an auxiliary tool's name is `search_tools`. If your output format will not let you \
+        Never tell the user you are unable to do something before you have searched for a tool that \
+        does it. Never guess an auxiliary tool's name and never treat one as a file path: \
+        `search_tools` is the only way to learn a real name. If your output format will not let you \
         call a tool that is absent from your schema, call `run_tool` with the name and arguments \
         instead.
         """
@@ -225,18 +224,23 @@ struct SearchToolsTool: AgentTool {
         let toolsets = Set(documents.map(\.toolsetDisplayName)).sorted().joined(separator: ", ")
 
         // Miss policy: never answer a search with nothing when tools exist. A weak match the model
-        // can reject beats a dead end - and the footer tells it how to widen the search.
+        // can reject beats a dead end - and this is the one place naming the areas helps, because there
+        // is no tool to name instead. Lowercased, so a re-query copies a phrase rather than a proper
+        // noun that reads like a path.
         guard !matches.isEmpty else {
             return ToolOutput(
-                "No tool matched \"\(query)\". Available toolsets: \(toolsets). "
-                    + "Try search_tools again with different words, or answer without a tool."
+                "No tool matched \"\(query)\". Areas that were searched: \(toolsets.lowercased()). "
+                    + "Call search_tools again describing the action you need, or answer without a tool."
             )
         }
 
-        // The legend is not decoration: a bare parameter name meaning "required" is an inference, and
-        // the whole point of the result is that the model can call the tool correctly first time.
-        var lines = ["Found \(matches.count) tool(s) for \"\(query)\". Call one by name, "
-            + "or use run_tool if you cannot call a tool that is not in your own schema. "
+        // The query is deliberately *not* echoed back. It was ("Found 5 tool(s) for \"Apple Notes\""),
+        // and re-injecting the model's own noun phrase is half of the failure recorded in
+        // `STEPS/ISSUES/tool-search-prompt-echo.md` - the model went on to read that string as a path.
+        //
+        // The legend is not decoration either: a bare parameter name meaning "required" is an inference,
+        // and the point of this result is that the model can call the tool correctly first time.
+        var lines = ["Found \(matches.count) matching tool(s). "
             + "In the signatures below `arg!` must be passed and `arg?` is optional.", ""]
         var used = lines.joined(separator: "\n").count
         var omitted = 0
@@ -288,10 +292,16 @@ struct SearchToolsTool: AgentTool {
         }
         lines.append("")
         if omitted > 0 { lines.append("(\(omitted) further match(es) omitted to stay within the result size.)") }
-        lines.append(
-            "Searched toolsets: \(toolsets). If none of these fit, call search_tools again with "
-                + "different words."
-        )
+        // End on the action, naming the best match. What sits last is what the model reaches for, and
+        // this used to end with a Title-Cased list of area labels followed by an invitation to search
+        // *again* - so the most recent thing it read was a copyable noun phrase and a fallback, not a
+        // callable name. See `STEPS/ISSUES/tool-search-prompt-echo.md`.
+        if let best = matches.first?.name {
+            lines.append(
+                "Call `\(best)` now if it does what you need, or one of the others above by name. Only "
+                    + "if none of them fit, call search_tools again describing the action differently."
+            )
+        }
         return ToolOutput(lines.joined(separator: "\n"))
     }
 }

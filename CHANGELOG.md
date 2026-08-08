@@ -61,6 +61,23 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   rejects a wrong value - a wasted round otherwise. Parameters are ordered required-first, then optional
   alphabetically: JSON schema properties arrive unordered, so without a rule the signature (and the
   document text the retriever caches) would differ between runs.
+- **The prompt no longer names any auxiliary capability, and a search result no longer echoes the
+  model's own words back at it.** On the 2.6B planner, "list my apple notes" reliably searched, got
+  `list_notes` back ranked first - and then about 60% of the time called `read_file ~/Apple Notes`
+  instead. Across five runs the deciding variable was the casing of the query the model itself wrote:
+  every lowercase query succeeded, every Title-Case one failed, and the failing argument was literally
+  `~/` plus that capitalized string. We were supplying it in three places, all of them added while
+  fixing earlier bugs: the prompt's `Apple Notes (4), Clipboard (2)` area list, the result header
+  (`Found 5 tool(s) for "Apple Notes"`), and - worst - the result's closing line
+  (`Searched toolsets: Apple Notes, …` followed by an invitation to *search again*), so the last thing
+  the model read was a copyable noun phrase and a fallback rather than a callable name.
+
+  Four changes: a result now **ends** by naming the best match (`Call \`list_notes\` now…`); the toolset
+  footer survives only on a miss, lowercased, where there is no tool to name instead; the query is not
+  echoed; and the prompt asks for "the action you need in a few lowercase words… not the name of an app,
+  a folder, or a file". The section itself now lists nothing at all - it teaches only the rule, and is
+  the same size for four auxiliary tools or four hundred. Full write-up in
+  `STEPS/ISSUES/tool-search-prompt-echo.md`.
 - **The search result shows the tool's own description, and explains every parameter.** It was showing
   the catalog's `summary` - a label written for a settings checkbox ("List available notes.") - instead of
   the `description` the tool publishes to models ("List the titles of the user's Apple Notes. Pass

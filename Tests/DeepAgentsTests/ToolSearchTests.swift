@@ -307,18 +307,29 @@ struct ToolSearchGuidanceTests {
         #expect(text.contains("never claim you can't"))
     }
 
-    @Test("The prompt names the auxiliary area, never the tools in it")
-    func indexNamesAreasNotTools() async {
-        // Areas, not names: knowing a notes capability exists is discoverability, and mapping a request
-        // onto `list_notes` is the retriever's job. Names would also cost O(tools) in every prompt -
-        // scaling with exactly what lazy loading exists to remove.
+    @Test("The prompt names no capability at all - not tools, not even areas")
+    func promptNamesNoCapabilities() async {
+        // The premise of the tier: auxiliary tools are discovered through `search_tools`, not nudged by
+        // a list. Tool names made the tier half-prefilled and cost O(tools); toolset labels were cheaper
+        // but caused the Title-Case echo in STEPS/ISSUES/tool-search-prompt-echo.md. The section is now
+        // O(1) - the same size whether there are four auxiliary tools or four hundred.
         let text = await prompt(auxiliary: true)
 
-        #expect(text.contains("core and auxiliary"))
-        #expect(text.contains("Apple Notes (4)"))
+        #expect(text.contains("core and auxiliary")) // the rule is still taught
+        #expect(!text.contains("Apple Notes")) // ...but the capability is not named
         for name in ["list_notes", "read_note", "create_note", "update_note"] {
             #expect(!text.contains(name), "\(name) should be discoverable only through search_tools")
         }
+    }
+
+    @Test("The section's size does not grow with the number of auxiliary tools")
+    func sectionIsConstantSize() {
+        // O(1), asserted rather than described: a fleet of MCP servers must not enlarge the prompt.
+        let few = ToolSearchMiddleware(auxiliaryTools: [EchoTool()]).systemPrompt
+        let many = ToolSearchMiddleware(
+            auxiliaryTools: (0 ..< 200).map { StubNamedTool("tool_\($0)") }
+        ).systemPrompt
+        #expect(few == many)
     }
 
     @Test("The section tells the model when to search, not just how")
@@ -533,17 +544,21 @@ struct ToolSearchWholeOutputTests {
         }
     }
 
-    @Test("Every auxiliary area is named, so the agent knows what to search for")
-    func everyAreaIsNamed() async throws {
-        // The other half: withholding the names must not withhold the *existence* of the capability, or
-        // the agent has nothing to search for.
+    @Test("No auxiliary area is named either, only the rule for finding them")
+    func noAreaIsNamed() async throws {
+        // The counterpart: the prompt teaches the *rule*, not the inventory. The model does not need to
+        // know which capabilities exist to know it must search when its visible tools fall short - and
+        // deriving the query from the user's own words is what the retriever is built for.
         let (agent, recorder) = makeAgent()
         _ = await agent.run([.human("hi")]) { _ in }
         let prompt = try #require(await recorder.systemPrompts.first.flatMap { $0 })
 
-        for area in ["Apple Notes", "Git", "Web", "Search", "Clipboard", "System"] {
-            #expect(prompt.contains(area), "\(area) is hidden but never mentioned as an area")
+        for area in ["Apple Notes", "Clipboard"] {
+            #expect(!prompt.contains(area), "\(area) is named in the prompt; it should require a search")
         }
+        // What must survive: the obligation, and the query shape that stops the label echo.
+        #expect(prompt.contains("call `search_tools` before you answer"))
+        #expect(prompt.contains("not the name of an app, a folder, or a file"))
     }
 
     @Test("No tool silently loses its parameters")
@@ -854,7 +869,13 @@ struct SearchToolsResultTests {
         // Enough to call it without another lookup - including which arguments are mandatory, which
         // is the part a bare `text: string` left the model to guess at.
         #expect(text.contains("echo(text!: string)"))
-        #expect(text.contains("Searched toolsets:"))
+        // It ends on the action, naming the best match. What sits last is what the model reaches for,
+        // and this used to end with a Title-Cased area list plus an invitation to search again.
+        #expect(text.hasSuffix("describing the action differently."))
+        #expect(text.contains("Call `echo` now"))
+        // The query is not echoed back - re-injecting the model's own noun phrase is half of the
+        // failure in STEPS/ISSUES/tool-search-prompt-echo.md.
+        #expect(!text.contains("\"echo text\""))
     }
 
     @Test("A miss still names the toolsets and invites another search")
