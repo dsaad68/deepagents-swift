@@ -721,6 +721,7 @@ public struct ReactAgent: Sendable {
         let base: (ToolCallRequest) async throws -> AgentMessage = { request in
             let output = try await tool.execute(request.call.arguments, context)
             captured.value = output.stateUpdate
+            captured.failed = output.isFailure
             return .tool(output.content, toolCallID: call.id)
         }
 
@@ -738,6 +739,13 @@ public struct ReactAgent: Sendable {
             // thumbnail / a diff card.
             let imageURL = (captured.value?.values[ScreenshotState.pendingKey] as? [URL])?.first
             let editDiff = captured.value?.values[EditDiffState.pendingKey] as? FileDiff
+            // A tool that reported a failure without throwing is still a failure: report it as one
+            // so the transcript doesn't tick a call that did not do what was asked, and so the
+            // duplicate-round guard counts it like any other failed call.
+            guard !captured.failed else {
+                onEvent(.toolFailed(name: call.name, error: message.text, callID: call.id))
+                return (message, captured.value, true)
+            }
             onEvent(.toolCompleted(
                 name: call.name, result: message.text, imageURL: imageURL,
                 editDiff: editDiff, callID: call.id
@@ -821,6 +829,8 @@ public struct ReactAgent: Sendable {
 /// update back out of the `wrapToolCall` chain (which only carries the `AgentMessage`).
 private final class CapturedUpdate {
     var value: AgentStateUpdate?
+    /// Set when the tool reported a failure rather than throwing - see ``ToolOutput/isFailure``.
+    var failed = false
 }
 
 private extension AgentToolCall {

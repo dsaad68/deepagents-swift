@@ -74,7 +74,7 @@ public struct CalculatorTool: AgentTool {
         _ arguments: [String: AgentJSON], _ context: ToolContext
     ) async throws -> ToolOutput {
         guard case .string(let expression)? = arguments["expression"] else {
-            return ToolOutput("Error: `expression` is required.")
+            return ToolOutput.failure("Error: `expression` is required.")
         }
         guard let value = ArithmeticEvaluator.evaluate(expression) else {
             return ToolOutput(

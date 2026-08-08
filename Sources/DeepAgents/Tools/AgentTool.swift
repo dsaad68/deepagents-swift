@@ -25,10 +25,24 @@ public struct ToolContext: Sendable {
 public struct ToolOutput: Sendable {
     var content: String
     var stateUpdate: AgentStateUpdate?
+    /// Whether this result reports a failure. A tool that returns an error message rather than
+    /// throwing still failed, and a host has no way to know that from the text - so `read_file`
+    /// answering `Error: no file at "…"` used to be drawn with a success tick, telling the user
+    /// the call worked. The message reaches the model unchanged either way; this only decides how
+    /// the run reports it (`.toolFailed` rather than `.toolCompleted`).
+    var isFailure = false
 
     public init(_ content: String, stateUpdate: AgentStateUpdate? = nil) {
         self.content = content
         self.stateUpdate = stateUpdate
+    }
+
+    /// A recoverable failure. The text is returned to the model as the tool result exactly as
+    /// given, so it can correct itself; unlike throwing, nothing wraps or re-describes it.
+    public static func failure(_ content: String, stateUpdate: AgentStateUpdate? = nil) -> ToolOutput {
+        var output = ToolOutput(content, stateUpdate: stateUpdate)
+        output.isFailure = true
+        return output
     }
 }
 

@@ -120,6 +120,28 @@ return ToolOutput(text: "Result: 42.00")
 
 The text becomes the content of the tool-result message. Keep it informative - the model reads it in the next round to decide what to do next.
 
+### Report a failure as a failure
+
+A tool that could not do what was asked should return `ToolOutput.failure(...)` rather than a plain
+`ToolOutput` whose text happens to begin with "Error":
+
+```swift
+return ToolOutput.failure("Error: no file at \"\(path)\".")
+```
+
+The model receives the text **identically** either way - `.failure` is for recovery, not for hiding
+the message. What changes is how the run reports the call: `.toolFailed` instead of
+`.toolCompleted`, and the call counts as failed for the duplicate-round guard.
+
+This matters because a host has no other way to know. Before it existed, every built-in tool
+returned its errors as ordinary output, so `read_file` answering `Error: no file at "https://…"`
+was drawn in the transcript with a **success tick** - telling the user a call had worked when it
+had done nothing.
+
+Throwing also reports a failure and is right for genuinely exceptional cases, but the thrown error
+is re-described and wrapped before the model sees it. Return `.failure` when the wording is meant
+to help the model correct itself.
+
 ### Make the result say what it is
 
 The single most common cause of a small model looping is a result that doesn't read like an answer. The `tool` role already marks the turn as a result, but it says nothing about *what* the result is, and a bare fragment gets read as noise:

@@ -47,7 +47,9 @@ public struct FilesystemMiddleware: AgentMiddleware {
         and `mkdir` to create a folder (`write_file` already makes missing parent folders, \
         so you rarely need it). \
         Prefer the filesystem over keeping large content in the conversation. Files are \
-        shared with any subagents you delegate to.
+        shared with any subagents you delegate to. \
+        These tools read and write local files only. A URL is not a file path: to read a web \
+        page, fetch it with the web tools rather than passing the address to `read_file`.
         \(backend.promptNote)
         """
     }
@@ -78,7 +80,7 @@ public struct ListFilesTool: AgentTool {
             }
             return ToolOutput(files.joined(separator: "\n"))
         } catch {
-            return ToolOutput("Error: \(error.localizedDescription)")
+            return ToolOutput.failure("Error: \(error.localizedDescription)")
         }
     }
 }
@@ -87,7 +89,15 @@ public struct ListFilesTool: AgentTool {
 public struct ReadFileTool: AgentTool {
     let backend: any FilesystemBackend
     public var name: String { "read_file" }
-    public var description: String { "Read the full contents of a file in your working filesystem." }
+    /// The "not for URLs" clause is here rather than only in the system prompt because a small
+    /// model picks its tool from this line: a 2.6B called `read_file` with
+    /// `file_path: https://…/banana-bread-recipe/` and spent 29 seconds on it. The tool it wanted
+    /// is named, since "this is wrong" without "use that instead" leaves it nowhere to go.
+    public var description: String {
+        "Read the full contents of a file on disk, by path. Not for web pages: a URL "
+            + "(http:// or https://) is not a file path - fetch it with the web tools instead."
+    }
+
     /// Reads nothing another call in the round writes - the round of three `read_file`s is the
     /// case parallel dispatch exists for.
     public var isParallelSafe: Bool { true }
@@ -98,15 +108,15 @@ public struct ReadFileTool: AgentTool {
 
     public func execute(_ arguments: [String: AgentJSON], _ context: ToolContext) async throws -> ToolOutput {
         guard case .string(let path)? = arguments["file_path"] else {
-            return ToolOutput("Error: `file_path` is required.")
+            return ToolOutput.failure("Error: `file_path` is required.")
         }
         do {
             guard let content = try await backend.read(path) else {
-                return ToolOutput("Error: no file at \"\(path)\". \(backend.missingFileHint)")
+                return ToolOutput.failure("Error: no file at \"\(path)\". \(backend.missingFileHint)")
             }
             return ToolOutput(content.isEmpty ? "(file is empty)" : content)
         } catch {
-            return ToolOutput("Error: \(error.localizedDescription)")
+            return ToolOutput.failure("Error: \(error.localizedDescription)")
         }
     }
 }
@@ -126,7 +136,7 @@ public struct WriteFileTool: AgentTool {
 
     public func execute(_ arguments: [String: AgentJSON], _ context: ToolContext) async throws -> ToolOutput {
         guard case .string(let path)? = arguments["file_path"] else {
-            return ToolOutput("Error: `file_path` is required.")
+            return ToolOutput.failure("Error: `file_path` is required.")
         }
         let content: String
         if case .string(let text)? = arguments["content"] { content = text } else { content = "" }
@@ -134,7 +144,7 @@ public struct WriteFileTool: AgentTool {
             try await backend.write(path, content)
             return ToolOutput("Wrote \(content.count) character(s) to \"\(path)\".")
         } catch {
-            return ToolOutput("Error: \(error.localizedDescription)")
+            return ToolOutput.failure("Error: \(error.localizedDescription)")
         }
     }
 }
@@ -155,13 +165,13 @@ public struct MakeDirectoryTool: AgentTool {
         guard case .string(let path)? = arguments["path"],
               !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         else {
-            return ToolOutput("Error: `path` is required.")
+            return ToolOutput.failure("Error: `path` is required.")
         }
         do {
             try await backend.mkdir(path)
             return ToolOutput("Created folder \"\(path)\".")
         } catch {
-            return ToolOutput("Error: \(error.localizedDescription)")
+            return ToolOutput.failure("Error: \(error.localizedDescription)")
         }
     }
 }
@@ -191,10 +201,10 @@ public struct EditFileTool: AgentTool {
 
     public func execute(_ arguments: [String: AgentJSON], _ context: ToolContext) async throws -> ToolOutput {
         guard case .string(let path)? = arguments["file_path"] else {
-            return ToolOutput("Error: `file_path` is required.")
+            return ToolOutput.failure("Error: `file_path` is required.")
         }
         guard case .string(let old)? = arguments["old_string"] else {
-            return ToolOutput("Error: `old_string` is required.")
+            return ToolOutput.failure("Error: `old_string` is required.")
         }
         let new: String
         if case .string(let text)? = arguments["new_string"] { new = text } else { new = "" }
@@ -217,9 +227,9 @@ public struct EditFileTool: AgentTool {
             case .noChange:
                 return ToolOutput("Nothing to change: old_string and new_string are identical.")
             case .fileNotFound:
-                return ToolOutput("Error: no file at \"\(path)\". \(backend.missingFileHint)")
+                return ToolOutput.failure("Error: no file at \"\(path)\". \(backend.missingFileHint)")
             case .notFound(let hint):
-                return ToolOutput("Error: couldn't find that exact text in \"\(path)\". \(hint)")
+                return ToolOutput.failure("Error: couldn't find that exact text in \"\(path)\". \(hint)")
             case .notUnique(let lines):
                 let list = lines.map(String.init).joined(separator: ", ")
                 return ToolOutput(
@@ -228,7 +238,7 @@ public struct EditFileTool: AgentTool {
                 )
             }
         } catch {
-            return ToolOutput("Error: \(error.localizedDescription)")
+            return ToolOutput.failure("Error: \(error.localizedDescription)")
         }
     }
 }

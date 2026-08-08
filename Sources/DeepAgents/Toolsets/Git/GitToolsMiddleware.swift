@@ -73,7 +73,7 @@ public struct GitDiffTool: AgentTool {
         var scope = ""
         if let path = ToolArgs.string(arguments, "path") {
             guard let url = try? root.resolve(path) else {
-                return ToolOutput("Error: \"\(path)\" is outside the working folder.")
+                return ToolOutput.failure("Error: \"\(path)\" is outside the working folder.")
             }
             args += ["--", url.path]
             scope = " under \"\(path)\""
@@ -105,7 +105,7 @@ public struct GitLogTool: AgentTool {
         var scope = ""
         if let path = ToolArgs.string(arguments, "path") {
             guard let url = try? root.resolve(path) else {
-                return ToolOutput("Error: \"\(path)\" is outside the working folder.")
+                return ToolOutput.failure("Error: \"\(path)\" is outside the working folder.")
             }
             args += ["--", url.path]
             scope = path
@@ -132,7 +132,7 @@ public struct GitShowTool: AgentTool {
 
     public func execute(_ arguments: [String: AgentJSON], _ context: ToolContext) async throws -> ToolOutput {
         let ref = ToolArgs.string(arguments, "ref") ?? "HEAD"
-        guard !ToolArgs.looksLikeOption(ref) else { return ToolOutput("Error: invalid ref \"\(ref)\".") }
+        guard !ToolArgs.looksLikeOption(ref) else { return ToolOutput.failure("Error: invalid ref \"\(ref)\".") }
         return await ToolOutput(GitTools.run(root, ["show", ref]))
     }
 }
@@ -149,9 +149,9 @@ public struct GitBlameTool: AgentTool {
     }
 
     public func execute(_ arguments: [String: AgentJSON], _ context: ToolContext) async throws -> ToolOutput {
-        guard let path = ToolArgs.string(arguments, "path") else { return ToolOutput("Error: `path` is required.") }
+        guard let path = ToolArgs.string(arguments, "path") else { return ToolOutput.failure("Error: `path` is required.") }
         guard let url = try? root.resolve(path) else {
-            return ToolOutput("Error: \"\(path)\" is outside the working folder.")
+            return ToolOutput.failure("Error: \"\(path)\" is outside the working folder.")
         }
         return await ToolOutput(GitTools.run(
             root, ["blame", "--", url.path],

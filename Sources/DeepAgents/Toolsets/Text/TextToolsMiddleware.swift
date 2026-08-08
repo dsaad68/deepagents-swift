@@ -84,26 +84,26 @@ public struct DiffTool: AgentTool {
 
     public func execute(_ arguments: [String: AgentJSON], _ context: ToolContext) async throws -> ToolOutput {
         guard let a = ToolArgs.string(arguments, "a"), let b = ToolArgs.string(arguments, "b") else {
-            return ToolOutput("Error: both `a` and `b` are required.")
+            return ToolOutput.failure("Error: both `a` and `b` are required.")
         }
         let urlA: URL, urlB: URL
         do {
             urlA = try root.resolve(a)
             urlB = try root.resolve(b)
         } catch {
-            return ToolOutput("Error: \(error.localizedDescription)")
+            return ToolOutput.failure("Error: \(error.localizedDescription)")
         }
         do {
             let result = try await ProcessRunner.run("/usr/bin/diff", ["-u", urlA.path, urlB.path], cwd: root.rootURL)
-            if result.timedOut { return ToolOutput("Error: diff timed out.") }
+            if result.timedOut { return ToolOutput.failure("Error: diff timed out.") }
             switch result.status {
             case 0: return ToolOutput("The files are identical.")
             case 1: return ToolOutput(result.stdout.isEmpty ? "The files differ." : result.stdout)
             default:
-                return ToolOutput("Error: \(result.stderr.isEmpty ? "diff failed (status \(result.status))." : result.stderr)")
+                return ToolOutput.failure("Error: \(result.stderr.isEmpty ? "diff failed (status \(result.status))." : result.stderr)")
             }
         } catch {
-            return ToolOutput("Error: \(error.localizedDescription)")
+            return ToolOutput.failure("Error: \(error.localizedDescription)")
         }
     }
 }
@@ -112,23 +112,23 @@ public struct DiffTool: AgentTool {
 enum TextTools {
     static func peek(_ root: WorkspaceRoot, _ arguments: [String: AgentJSON], fromEnd: Bool) -> ToolOutput {
         guard let path = ToolArgs.string(arguments, "path") else {
-            return ToolOutput("Error: `path` is required.")
+            return ToolOutput.failure("Error: `path` is required.")
         }
         let url: URL
         do { url = try root.resolve(path) } catch {
-            return ToolOutput("Error: \(error.localizedDescription)")
+            return ToolOutput.failure("Error: \(error.localizedDescription)")
         }
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
-            return ToolOutput("Error: no file at \"\(path)\".")
+            return ToolOutput.failure("Error: no file at \"\(path)\".")
         }
-        guard !isDirectory.boolValue else { return ToolOutput("Error: \"\(path)\" is a folder, not a file.") }
+        guard !isDirectory.boolValue else { return ToolOutput.failure("Error: \"\(path)\" is a folder, not a file.") }
         guard let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize,
               size <= LocalFilesystemBackend.maxReadBytes else {
-            return ToolOutput("Error: \"\(path)\" is too large to read.")
+            return ToolOutput.failure("Error: \"\(path)\" is too large to read.")
         }
         guard let data = try? Data(contentsOf: url), let text = String(data: data, encoding: .utf8) else {
-            return ToolOutput("Error: \"\(path)\" isn't a UTF-8 text file.")
+            return ToolOutput.failure("Error: \"\(path)\" isn't a UTF-8 text file.")
         }
         let count = max(1, ToolArgs.int(arguments, "lines") ?? 10)
         let lines = text.split(separator: "\n", omittingEmptySubsequences: false)

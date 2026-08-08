@@ -56,18 +56,18 @@ public struct GrepTool: AgentTool {
 
     public func execute(_ arguments: [String: AgentJSON], _ context: ToolContext) async throws -> ToolOutput {
         guard let pattern = ToolArgs.rawString(arguments, "pattern"), !pattern.isEmpty else {
-            return ToolOutput("Error: `pattern` is required.")
+            return ToolOutput.failure("Error: `pattern` is required.")
         }
         var options: NSRegularExpression.Options = []
         if ToolArgs.bool(arguments, "ignore_case") { options.insert(.caseInsensitive) }
         guard let regex = try? NSRegularExpression(pattern: pattern, options: options) else {
-            return ToolOutput("Error: invalid regular expression: \(pattern)")
+            return ToolOutput.failure("Error: invalid regular expression: \(pattern)")
         }
         let include = ToolArgs.string(arguments, "include").map(GlobPattern.init)
 
         let base: URL
         do { base = try root.resolve(ToolArgs.string(arguments, "path") ?? "") } catch {
-            return ToolOutput("Error: \(error.localizedDescription)")
+            return ToolOutput.failure("Error: \(error.localizedDescription)")
         }
 
         var results: [String] = []
@@ -134,11 +134,11 @@ public struct GlobTool: AgentTool {
 
     public func execute(_ arguments: [String: AgentJSON], _ context: ToolContext) async throws -> ToolOutput {
         guard let pattern = ToolArgs.string(arguments, "pattern") else {
-            return ToolOutput("Error: `pattern` is required.")
+            return ToolOutput.failure("Error: `pattern` is required.")
         }
         let base: URL
         do { base = try root.resolve(ToolArgs.string(arguments, "path") ?? "") } catch {
-            return ToolOutput("Error: \(error.localizedDescription)")
+            return ToolOutput.failure("Error: \(error.localizedDescription)")
         }
         let glob = GlobPattern(pattern)
         let matchPath = pattern.contains("/")
@@ -191,11 +191,11 @@ public struct TreeTool: AgentTool {
     public func execute(_ arguments: [String: AgentJSON], _ context: ToolContext) async throws -> ToolOutput {
         let base: URL
         do { base = try root.resolve(ToolArgs.string(arguments, "path") ?? "") } catch {
-            return ToolOutput("Error: \(error.localizedDescription)")
+            return ToolOutput.failure("Error: \(error.localizedDescription)")
         }
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: base.path, isDirectory: &isDirectory) else {
-            return ToolOutput("Error: no folder at \"\(root.relativePath(base))\".")
+            return ToolOutput.failure("Error: no folder at \"\(root.relativePath(base))\".")
         }
         guard isDirectory.boolValue else { return ToolOutput("\(root.relativePath(base)) (a file, not a folder)") }
 
