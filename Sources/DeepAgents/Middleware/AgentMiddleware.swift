@@ -70,6 +70,24 @@ extension AgentMiddleware {
     public var name: String { String(describing: Self.self) }
     public var tools: [any AgentTool] { [] }
 
+    /// Whether any of this middleware's tools will actually be rendered into this round's prompt.
+    ///
+    /// **Gate prompt guidance on this.** A capability middleware normally appends a section naming its
+    /// tools and telling the model how to use them, but ``ToolSearchMiddleware`` withholds the schemas
+    /// of auxiliary tools - and prose insisting the model can create an Apple Note, when no
+    /// `create_note` schema was rendered, is worse than silence: it asserts a capability and leaves no
+    /// way to reach it, so the model either claims it did something it could not, or reaches for an
+    /// unrelated tool. (The guidance for an auxiliary tool arrives with its signature, in the
+    /// `search_tools` result.)
+    ///
+    /// Middleware that contribute no tools keep their guidance unconditionally.
+    public func contributesRenderedTools(to request: ModelRequest) -> Bool {
+        let mine = tools
+        guard !mine.isEmpty else { return true }
+        let rendered = Set(request.tools.map(\.name))
+        return mine.contains { rendered.contains($0.name) }
+    }
+
     public func beforeAgent(_ state: inout AgentState) async {}
     public func beforeModel(_ state: inout AgentState) async {}
     public func afterModel(_ state: inout AgentState) async {}

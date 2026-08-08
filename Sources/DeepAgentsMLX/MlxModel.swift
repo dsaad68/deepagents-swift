@@ -12,7 +12,12 @@ public enum MlxCodecFamily: Sendable { case lfm2, qwen35, gemma4 }
 /// reasoning VLMs (Ornith, Qwen3.6) and Gemma 4 E4B, and is trivially extensible: add a row
 /// here and it shows up in Settings ▸ Local models.
 public struct MlxModel: Identifiable, Sendable, Hashable {
-    public enum Kind: Sendable { case language, vision }
+    /// What a catalog row is *for*. `retriever` rows are not chat models at all - they back
+    /// `search_tools` (see ``ColBERTToolRetriever``) and load through `MLXEmbedders`, not through
+    /// ``MlxModelLoader``. They are cataloged anyway so they appear in the Local models list and can be
+    /// downloaded, sized, and deleted like everything else; ``languageCatalog`` keeps them out of the
+    /// planner picker, where selecting one would fail at load.
+    public enum Kind: Sendable { case language, vision, retriever }
 
     /// The unique selection key, and normally the Hugging Face repo id itself, e.g.
     /// "LiquidAI/LFM2.5-1.2B-Instruct-MLX-8bit". When a conversion packs several precisions into one
@@ -237,10 +242,26 @@ public struct MlxModel: Identifiable, Sendable, Hashable {
         MlxModel(id: "LiquidAI/LFM2.5-VL-450M-MLX-bf16",
                  displayName: "LFM2.5-VL 450M", detail: "Vision · bf16", kind: .vision, approxGB: 1.0),
         MlxModel(id: "mlx-community/LFM2.5-VL-1.6B-8bit",
-                 displayName: "LFM2.5-VL 1.6B", detail: "Vision · 8-bit", kind: .vision, approxGB: 2.1)
+                 displayName: "LFM2.5-VL 1.6B", detail: "Vision · 8-bit", kind: .vision, approxGB: 2.1),
+        // Retrieval encoders for `search_tools` (lazy tools). Not chat models: they load through
+        // `MLXEmbedders` as `LFM2BidirectionalModel` with the ColBERT head, and `languageCatalog`
+        // excludes them from the planner picker. Cataloged so they list, download, and delete in
+        // `/model` → Local like everything else.
+        MlxModel(id: "mlx-community/LFM2.5-ColBERT-350M-8bit",
+                 displayName: "LFM2.5-ColBERT 350M", detail: "Tool search · 8-bit",
+                 kind: .retriever, approxGB: 0.4),
+        MlxModel(id: "mlx-community/LFM2.5-ColBERT-350M-bf16",
+                 displayName: "LFM2.5-ColBERT 350M", detail: "Tool search · bf16",
+                 kind: .retriever, approxGB: 0.7)
     ]
 
     /// Text (instruct) models only — used by the Translate model picker (translation runs
     /// on a language model, never a VLM).
-    public static var languageCatalog: [MlxModel] { catalog.filter { !$0.isVision } }
+    /// The rows that can drive the ReAct loop. Filtered *positively* on `.language`: it used to be
+    /// `!isVision`, which silently admitted any future non-vision kind - and a `.retriever` row picked
+    /// as the planner would fail at load, because it is an encoder with no LM head.
+    public static var languageCatalog: [MlxModel] { catalog.filter { $0.kind == .language } }
+
+    /// The retrieval encoders that can back `search_tools`.
+    public static var retrieverCatalog: [MlxModel] { catalog.filter { $0.kind == .retriever } }
 }

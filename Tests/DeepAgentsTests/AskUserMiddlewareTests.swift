@@ -164,8 +164,11 @@ struct AskUserMiddlewareTests {
     @Test func wrapModelCallAppendsAskUserGuidance() async throws {
         let middleware = AskUserMiddleware(handler: { _ in .cancelled })
         var captured: String?
+        // The request carries the middleware's own tool, as the real agent's always does: guidance is
+        // gated on the tool actually being rendered (`contributesRenderedTools(to:)`), because prose
+        // describing a withheld schema tells the model to call something it cannot.
         _ = try await middleware.wrapModelCall(
-            ModelRequest(messages: [], systemPrompt: "BASE", tools: [])
+            ModelRequest(messages: [], systemPrompt: "BASE", tools: middleware.tools)
         ) { request in
             captured = request.systemPrompt
             return ModelResponse(message: .ai("x"))
@@ -173,6 +176,20 @@ struct AskUserMiddlewareTests {
         let prompt = try #require(captured)
         #expect(prompt.hasPrefix("BASE"))
         #expect(prompt.contains("## `ask_user`"))
+    }
+
+    @Test func wrapModelCallWithholdsGuidanceWhenTheToolIsNotRendered() async throws {
+        // The lazy-tools case: `ask_user` tiered auxiliary means no schema in the prompt, so no prose
+        // about it either.
+        let middleware = AskUserMiddleware(handler: { _ in .cancelled })
+        var captured: String?
+        _ = try await middleware.wrapModelCall(
+            ModelRequest(messages: [], systemPrompt: "BASE", tools: [])
+        ) { request in
+            captured = request.systemPrompt
+            return ModelResponse(message: .ai("x"))
+        }
+        #expect(captured == "BASE")
     }
 
     /// The `questions` array delivered as one JSON *string* still parses - a tool-call parser

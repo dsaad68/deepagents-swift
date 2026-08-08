@@ -62,6 +62,9 @@ public struct ScreenshotMiddleware: AgentMiddleware {
         _ request: ModelRequest,
         _ handler: (ModelRequest) async throws -> ModelResponse
     ) async throws -> ModelResponse {
+        // No guidance for tools whose schemas were withheld this round - see
+        // `contributesRenderedTools(to:)`.
+        guard contributesRenderedTools(to: request) else { return try await handler(request) }
         let guidance = attachToConversation ? Self.systemPrompt : Self.delegatedSystemPrompt
         let composed = [request.systemPrompt, guidance]
             .compactMap { $0 }

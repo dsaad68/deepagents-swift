@@ -192,8 +192,31 @@ public struct ReactAgent: Sendable {
     private func seedSummarizationState(_ state: inout AgentState, threadId: String?) {
         if let threadId { state.values[SummarizationMiddleware.threadIdStateKey] = threadId }
         guard middleware.contains(where: { $0 is SummarizationMiddleware }) else { return }
-        let overhead = SummarizationMiddleware.promptOverheadText(systemPrompt: systemPrompt, tools: tools)
+        let overhead = SummarizationMiddleware.promptOverheadText(
+            systemPrompt: systemPrompt, tools: renderedTools
+        )
         if !overhead.isEmpty { state.values[SummarizationMiddleware.promptOverheadStateKey] = overhead }
+    }
+
+    /// The tools whose schemas actually reach the prompt: ``tools`` minus anything a middleware hides
+    /// from the *rendered* request while keeping it dispatchable (``ToolRenderFiltering``, i.e.
+    /// ``ToolSearchMiddleware``'s auxiliary tools).
+    ///
+    /// Only the prompt-size estimates use this. Dispatch deliberately keeps resolving against the full
+    /// ``tools`` - that is what lets an auxiliary tool be invisible and still callable - and measuring
+    /// overhead against the full list would count schemas the model never sees, tripping
+    /// summarization early.
+    ///
+    /// Public because a host wants the same number: ripple's banner reports how many tools are being
+    /// held back, and a context meter that measured ``tools`` would overstate the prompt.
+    public var renderedTools: [any AgentTool] {
+        let hidden = middleware.reduce(into: Set<String>()) { names, middleware in
+            if let filtering = middleware as? any ToolRenderFiltering {
+                names.formUnion(filtering.hiddenToolNames)
+            }
+        }
+        guard !hidden.isEmpty else { return tools }
+        return tools.filter { !hidden.contains($0.name) }
     }
 
     /// Run every middleware's `beforeModel` hook, then emit a `.contextCompacted` event if one of
@@ -586,7 +609,12 @@ public struct ReactAgent: Sendable {
         // miss means the model named no tool of ours, not that it spelled one differently.
         guard let tool = tools.first(where: { $0.name == call.name }) else {
             let names = tools.map(\.name).joined(separator: ", ")
-            let text = Self.errorJSON("Unknown tool '\(call.name)'. Available tools: \(names).")
+            // With lazy tools on, most of these names are not in the model's own schema, so point at
+            // the way to recover rather than leaving a bare list. Turns a dead end into a next step.
+            let recovery = tools.contains { $0.name == "search_tools" }
+                ? " If the capability you need is not listed, call search_tools to find its exact name."
+                : ""
+            let text = Self.errorJSON("Unknown tool '\(call.name)'. Available tools: \(names).\(recovery)")
             onEvent(.toolFailed(name: call.name, error: text, callID: call.id))
             return (.tool(text, toolCallID: call.id), nil, true)
         }
@@ -674,7 +702,9 @@ public struct ReactAgent: Sendable {
         var messages = await loadHistory(threadId)
         // Match the automatic path: count the fixed prompt overhead (system prompt + tool schemas) so
         // the reported before/after sizes reflect the real request, not just the conversation.
-        let overheadText = SummarizationMiddleware.promptOverheadText(systemPrompt: systemPrompt, tools: tools)
+        let overheadText = SummarizationMiddleware.promptOverheadText(
+            systemPrompt: systemPrompt, tools: renderedTools
+        )
         let overhead = summarizer.tokenCounter.count(overheadText)
         guard let outcome = await summarizer.compact(
             &messages, threadId: threadId, force: true, overheadTokens: overhead

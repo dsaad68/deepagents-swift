@@ -34,6 +34,9 @@ public struct ShellToolsMiddleware: AgentMiddleware {
         _ request: ModelRequest,
         _ handler: (ModelRequest) async throws -> ModelResponse
     ) async throws -> ModelResponse {
+        // No guidance for tools whose schemas were withheld this round - see
+        // `contributesRenderedTools(to:)`.
+        guard contributesRenderedTools(to: request) else { return try await handler(request) }
         let composed = [request.systemPrompt, Self.systemPrompt]
             .compactMap { $0 }
             .joined(separator: "\n\n")

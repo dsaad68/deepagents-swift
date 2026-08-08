@@ -150,6 +150,35 @@ public func mcpApprovalDefaults(
     return defaults
 }
 
+/// The tools of every server the user tiered ``ToolTier/auxiliary``, to pass as
+/// `AgentToolPolicy.expand(extraAuxiliary:)`. MCP tools are not in ``MiddlewareCatalog``, so the
+/// per-server tier is the only thing that can classify them.
+///
+/// Attributed via ``ServerScopedTool``, like ``mcpApprovalDefaults(servers:tools:)``; a tool naming no
+/// server is left alone (it stays core).
+public func mcpAuxiliaryToolNames(
+    servers: [MCPServerConfig], tools: [any AgentTool]
+) -> Set<String> {
+    var names: Set<String> = []
+    for server in servers where server.tier == .auxiliary {
+        for tool in toolsFromServer(server.name, in: tools) { names.insert(tool.name) }
+    }
+    return names
+}
+
+/// Which server contributed each tool, for `createDeepAgent(toolsetsByTool:)` - it is what lets the
+/// search corpus and the "searched toolsets" footer name an MCP tool's origin instead of filing it
+/// under "Other".
+public func mcpToolsetsByTool(
+    servers: [MCPServerConfig], tools: [any AgentTool]
+) -> [String: String] {
+    var toolsets: [String: String] = [:]
+    for server in servers {
+        for tool in toolsFromServer(server.name, in: tools) { toolsets[tool.name] = server.name }
+    }
+    return toolsets
+}
+
 /// The outcome of connecting to one MCP server: how many tools it contributed, or the error that
 /// kept it from loading (a 401, a bad URL, a missing stdio binary). Lets the REPL banner and the
 /// `/mcp` browser report a server that failed to connect, instead of showing it as a blank

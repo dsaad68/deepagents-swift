@@ -133,6 +133,51 @@ Capability middleware provides toolsets that map cleanly to a single concern. Al
 
 ---
 
+## `ToolSearchMiddleware` - lazy tool loading
+
+Every tool's JSON schema normally goes into the prompt on every round. `ToolSearchMiddleware` splits the tool set into two tiers so that most of it does not:
+
+- **Core** tools are rendered as usual.
+- **Auxiliary** tools are stripped from `ModelRequest.tools` in `wrapModelCall`, so they never reach the prompt - but they stay in `ReactAgent.tools`, and `ReactAgent` dispatches against *that*. They remain fully callable: **invisible, but executable.**
+
+The agent finds them with the two meta-tools the middleware contributes:
+
+| Tool | Purpose |
+|---|---|
+| `search_tools` | Rank auxiliary tools against a description of what is needed; returns names and signatures as its tool *result*. |
+| `run_tool` | Call an auxiliary tool by name, for a model that will not emit a name absent from its own schema. |
+
+Enable it through `createDeepAgent`:
+
+```swift
+let agent = createDeepAgent(
+    model: model,
+    middleware: [GitToolsMiddleware(root: root), WebToolsMiddleware()],
+    auxiliaryToolNames: policy.expand().auxiliaryToolNames,
+    toolRetriever: ColBERTToolRetriever(),   // or omit for LexicalToolRetriever
+    toolSearchLimit: 5
+)
+```
+
+### Why the schemas arrive as a tool result
+
+`MlxChatModel` caches the KV of the prompt's stable prefix and fingerprints it on `systemPrompt + toolNames`, so *growing* the tool list mid-run would reset that cache and force a re-prefill - the obvious implementation of lazy tools is the one thing that cannot be done cheaply. So the rendered set never changes: it is a constant filter, and everything discovery produces arrives as conversation content, which appends past the cached tip. Editing a tier costs one re-prefill; discovering a tool costs none.
+
+`ReactAgent.renderedTools` (via the `ToolRenderFiltering` protocol) is what the prompt-overhead estimate measures, so summarization is not triggered early by schemas the model never sees.
+
+`run_tool` is rewritten into a direct call inside `wrapModelCall`, before `ReactAgent` normalizes, records, or dispatches it - which is what keeps the approval gate, the message log, and the transcript pointed at the real tool.
+
+### Retrievers
+
+`ToolRetriever` ranks the auxiliary corpus. Two ship:
+
+| Type | Product | Notes |
+|---|---|---|
+| `LexicalToolRetriever` | `DeepAgents` | IDF-weighted term overlap. No model, no download - the default. |
+| `ColBERTToolRetriever` | `DeepAgentsMLX` | LFM2.5-ColBERT-350M late interaction (MaxSim over per-token 128-d vectors), 8-bit or bf16 via `ToolSearchModel`. |
+
+---
+
 ## `createDeepAgent` composition order
 
 When you call `createDeepAgent`, middleware is assembled in this order before being handed to `ReactAgent`:
@@ -141,9 +186,10 @@ When you call `createDeepAgent`, middleware is assembled in this order before be
 2. `FilesystemMiddleware` (when `includeFilesystem: true`)
 3. `SubAgentMiddleware` (when `subagents` is non-empty or `includeGeneralPurpose: true`)
 4. Your `middleware` array (in the order you provide)
-5. `AskUserMiddleware` (when `askUserHandler != nil`)
-6. `HumanInTheLoopMiddleware` (when `approvalHandler != nil`)
-7. `SummarizationMiddleware` (when `summarization != nil`)
+5. `ToolSearchMiddleware` (when `auxiliaryToolNames` is non-empty)
+6. `AskUserMiddleware` (when `askUserHandler != nil`)
+7. `HumanInTheLoopMiddleware` (when `approvalHandler != nil`)
+8. `SummarizationMiddleware` (when `summarization != nil`)
 
 Because `wrapToolCall` nests with the first-registered middleware outermost, `HumanInTheLoopMiddleware` always wraps the outermost layer of tool dispatch - meaning approval fires before any inner middleware can execute the call. Summarization hooks `beforeModel`, so it runs last in that phase and can compact the history produced by all prior middleware.
 
@@ -164,10 +210,18 @@ public struct AgentToolPolicy: Codable, Sendable {
     public var approvals: [String: ToolApprovalMode]
     public var sandbox: SandboxMode
     public var sandboxImage: String?
+    // Lazy tools - see `ToolSearchMiddleware`. Inert while `toolSearch` is false.
+    public var toolSearch: Bool
+    public var auxiliaryMiddleware: Set<String>  // middleware IDs whose tools are auxiliary
+    public var auxiliaryTools: Set<String>       // individual auxiliary tool names
+    public var coreMCPServers: Set<String>       // servers promoted to core (MCP defaults to auxiliary)
+    public var toolSearchModel: String?          // retriever repo id; nil = lexical
+    public var toolSearchLimit: Int
 
     public func expand(
         catalog: [MiddlewareDescriptor] = MiddlewareCatalog.all,
-        extraDefaults: [String: ToolApprovalMode] = [:]
+        extraDefaults: [String: ToolApprovalMode] = [:],
+        extraAuxiliary: Set<String> = []
     ) -> Expansion
 }
 ```

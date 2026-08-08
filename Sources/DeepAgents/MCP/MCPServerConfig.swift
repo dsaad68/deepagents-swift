@@ -51,11 +51,19 @@ public struct MCPServerConfig: Codable, Sendable, Identifiable, Hashable {
     /// (`ask`, the default - MCP tools are outward-facing), or always reject (`deny`).
     public var approvalMode: ToolApprovalMode = .ask
 
+    /// Whether this server's tool schemas are prefilled into every prompt (``ToolTier/core``) or
+    /// found on demand through `search_tools` (``ToolTier/auxiliary``, the default).
+    ///
+    /// Auxiliary is the default because MCP servers are the verbose ones - a handful of them can be
+    /// most of the static prompt - and because it only takes effect once the user turns
+    /// ``AgentToolPolicy/toolSearch`` on, so an existing setup is unaffected until then.
+    public var tier: ToolTier = .auxiliary
+
     public init(
         id: UUID = .init(), name: String, kind: Kind, isEnabled: Bool = true,
         command: String = "", args: [String] = [], env: [String: String] = [:],
         url: String = "", headers: [String: String] = [:], auth: Auth = .none,
-        approvalMode: ToolApprovalMode = .ask
+        approvalMode: ToolApprovalMode = .ask, tier: ToolTier = .auxiliary
     ) {
         self.id = id
         self.name = name
@@ -68,6 +76,7 @@ public struct MCPServerConfig: Codable, Sendable, Identifiable, Hashable {
         self.headers = headers
         self.auth = auth
         self.approvalMode = approvalMode
+        self.tier = tier
     }
 
     /// Tolerant decoding: any field missing from older stored JSON falls back to its default, so
@@ -86,5 +95,6 @@ public struct MCPServerConfig: Codable, Sendable, Identifiable, Hashable {
         headers = try container.decodeIfPresent([String: String].self, forKey: .headers) ?? [:]
         auth = try container.decodeIfPresent(Auth.self, forKey: .auth) ?? .none
         approvalMode = try container.decodeIfPresent(ToolApprovalMode.self, forKey: .approvalMode) ?? .ask
+        tier = try container.decodeIfPresent(ToolTier.self, forKey: .tier) ?? .auxiliary
     }
 }

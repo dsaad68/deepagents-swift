@@ -26,6 +26,9 @@ public struct AskUserMiddleware: AgentMiddleware {
         _ request: ModelRequest,
         _ next: (ModelRequest) async throws -> ModelResponse
     ) async throws -> ModelResponse {
+        // No guidance for tools whose schemas were withheld this round - see
+        // `contributesRenderedTools(to:)`.
+        guard contributesRenderedTools(to: request) else { return try await next(request) }
         let composed = [request.systemPrompt, Self.systemPrompt]
             .compactMap { $0 }
             .joined(separator: "\n\n")

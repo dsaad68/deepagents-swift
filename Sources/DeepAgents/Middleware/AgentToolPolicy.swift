@@ -50,19 +50,50 @@ public struct AgentToolPolicy: Codable, Sendable, Equatable {
     /// The OCI image the sandbox container runs, or nil for the built-in default
     /// (`ghcr.io/astral-sh/uv:python3.13-alpine3.23`).
     public var sandboxImage: String?
+    /// Whether lazy tool loading is on (see ``ToolSearchMiddleware``). Off means every enabled tool's
+    /// schema is prefilled, exactly as before this setting existed - so the two `auxiliary*` sets
+    /// below are inert until it is turned on.
+    public var toolSearch: Bool
+    /// Capability middleware whose tools are ``ToolTier/auxiliary`` - found via `search_tools` rather
+    /// than prefilled (by ``AgentMiddleware/name``).
+    public var auxiliaryMiddleware: Set<String>
+    /// Individual tools marked auxiliary (by dispatch name), independent of their middleware.
+    public var auxiliaryTools: Set<String>
+    /// MCP servers the user **promoted to core** (by server name). Stored as the promotions rather
+    /// than the demotions because ``MCPServerConfig/tier`` defaults to auxiliary: MCP schemas are the
+    /// verbose ones, so "auxiliary unless asked otherwise" is the useful default and an empty set
+    /// means it.
+    public var coreMCPServers: Set<String>
+    /// Hugging Face repo id of the retrieval model backing `search_tools`, or nil for the lexical
+    /// retriever (which needs no model).
+    public var toolSearchModel: String?
+    /// How many matches `search_tools` returns by default.
+    public var toolSearchLimit: Int
 
     public init(
         disabledMiddleware: Set<String> = [],
         disabledTools: Set<String> = [],
         approvals: [String: ToolApprovalMode] = [:],
         sandbox: SandboxMode = .off,
-        sandboxImage: String? = nil
+        sandboxImage: String? = nil,
+        toolSearch: Bool = false,
+        auxiliaryMiddleware: Set<String> = [],
+        auxiliaryTools: Set<String> = [],
+        coreMCPServers: Set<String> = [],
+        toolSearchModel: String? = nil,
+        toolSearchLimit: Int = 5
     ) {
         self.disabledMiddleware = disabledMiddleware
         self.disabledTools = disabledTools
         self.approvals = approvals
         self.sandbox = sandbox
         self.sandboxImage = sandboxImage
+        self.toolSearch = toolSearch
+        self.auxiliaryMiddleware = auxiliaryMiddleware
+        self.auxiliaryTools = auxiliaryTools
+        self.coreMCPServers = coreMCPServers
+        self.toolSearchModel = toolSearchModel
+        self.toolSearchLimit = toolSearchLimit
     }
 
     /// Decoding tolerates older/partial JSON (any missing field falls back to its default), so a
@@ -74,6 +105,12 @@ public struct AgentToolPolicy: Codable, Sendable, Equatable {
         approvals = try container.decodeIfPresent([String: ToolApprovalMode].self, forKey: .approvals) ?? [:]
         sandbox = try container.decodeIfPresent(SandboxMode.self, forKey: .sandbox) ?? .off
         sandboxImage = try container.decodeIfPresent(String.self, forKey: .sandboxImage)
+        toolSearch = try container.decodeIfPresent(Bool.self, forKey: .toolSearch) ?? false
+        auxiliaryMiddleware = try container.decodeIfPresent(Set<String>.self, forKey: .auxiliaryMiddleware) ?? []
+        auxiliaryTools = try container.decodeIfPresent(Set<String>.self, forKey: .auxiliaryTools) ?? []
+        coreMCPServers = try container.decodeIfPresent(Set<String>.self, forKey: .coreMCPServers) ?? []
+        toolSearchModel = try container.decodeIfPresent(String.self, forKey: .toolSearchModel)
+        toolSearchLimit = try container.decodeIfPresent(Int.self, forKey: .toolSearchLimit) ?? 5
     }
 
     /// Whether the local `shell` tool is active under the sandbox governance: container-only forces
@@ -107,6 +144,10 @@ public struct AgentToolPolicy: Codable, Sendable, Equatable {
         public var interruptOn: [String: InterruptOnConfig]
         /// The subset of `interruptOn` set to `deny`, which the approval handler auto-rejects.
         public var denyToolNames: Set<String>
+        /// Tool names to hide from the *prompt* but keep dispatchable, for
+        /// ``ToolSearchMiddleware``. Empty when ``AgentToolPolicy/toolSearch`` is off. Disjoint from
+        /// `disabledToolNames`: a disabled tool is gone, not merely unlisted.
+        public var auxiliaryToolNames: Set<String>
     }
 
     /// Expand into `(disabledToolNames, interruptOn, denyToolNames)`.
@@ -116,9 +157,12 @@ public struct AgentToolPolicy: Codable, Sendable, Equatable {
     ///     middleware→tools mapping for `disabledMiddleware` and per-tool default approvals.
     ///   - extraDefaults: default approvals for tools outside the catalog - e.g. MCP tools, where
     ///     each server contributes its tools' names and chosen mode.
+    ///   - extraAuxiliary: auxiliary tool names from outside the catalog - the tools of every MCP
+    ///     server the user tiered as ``ToolTier/auxiliary``. Ignored when `toolSearch` is off.
     public func expand(
         catalog: [MiddlewareDescriptor] = MiddlewareCatalog.all,
-        extraDefaults: [String: ToolApprovalMode] = [:]
+        extraDefaults: [String: ToolApprovalMode] = [:],
+        extraAuxiliary: Set<String> = []
     ) -> Expansion {
         var disabled = disabledTools
         for middleware in catalog where disabledMiddleware.contains(middleware.id) {
@@ -156,13 +200,42 @@ public struct AgentToolPolicy: Codable, Sendable, Equatable {
             }
         }
 
+        // Tiers only mean anything with the feature on. A disabled tool is subtracted rather than
+        // hidden: it isn't in the agent's tool list at all, so calling it auxiliary would put a name
+        // in the search corpus that can never be dispatched.
+        var auxiliary: Set<String> = []
+        if toolSearch {
+            auxiliary = auxiliaryTools.union(extraAuxiliary)
+            for middleware in catalog where auxiliaryMiddleware.contains(middleware.id) {
+                for tool in middleware.tools { auxiliary.insert(tool.name) }
+            }
+            auxiliary.subtract(disabled)
+        }
+
         return Expansion(
-            disabledToolNames: disabled, interruptOn: interruptOn, denyToolNames: denyToolNames
+            disabledToolNames: disabled, interruptOn: interruptOn, denyToolNames: denyToolNames,
+            auxiliaryToolNames: auxiliary
         )
     }
 
     private enum CodingKeys: String, CodingKey {
         case disabledMiddleware, disabledTools, approvals, sandbox, sandboxImage
+        case toolSearch, auxiliaryMiddleware, auxiliaryTools, coreMCPServers
+        case toolSearchModel, toolSearchLimit
+    }
+
+    /// `servers` with each entry's ``MCPServerConfig/tier`` set from this policy, so the framework's
+    /// single classifier (``mcpAuxiliaryToolNames(servers:tools:)``) sees the user's choice.
+    ///
+    /// Ripple keeps the tier here rather than in `mcp.json` because that file may be a *shared*
+    /// `.mcp.json` (the format Claude and Cursor read) - writing our own keys into it would be rude.
+    /// The app, which owns its server storage outright, can set `tier` directly instead.
+    public func tiered(_ servers: [MCPServerConfig]) -> [MCPServerConfig] {
+        servers.map { server in
+            var copy = server
+            copy.tier = coreMCPServers.contains(server.name) ? .core : .auxiliary
+            return copy
+        }
     }
 }
 

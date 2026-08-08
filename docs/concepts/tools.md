@@ -182,14 +182,27 @@ public struct AgentToolPolicy: Codable, Sendable {
     public var sandbox: SandboxMode                    // .off / .failover / .containerOnly
     public var sandboxImage: String?                   // Docker image for container sandbox
 
+    // Lazy tools (see `ToolSearchMiddleware`). Inert while `toolSearch` is false.
+    public var toolSearch: Bool                        // the feature switch
+    public var auxiliaryMiddleware: Set<String>        // catalog IDs whose tools are auxiliary
+    public var auxiliaryTools: Set<String>             // individual auxiliary tool names
+    public var coreMCPServers: Set<String>             // MCP servers promoted to core (default: auxiliary)
+    public var toolSearchModel: String?                // retriever repo id; nil = lexical
+    public var toolSearchLimit: Int                    // matches per `search_tools` call
+
     public func expand(
         catalog: [MiddlewareDescriptor] = MiddlewareCatalog.all,
-        extraDefaults: [String: ToolApprovalMode] = [:]
+        extraDefaults: [String: ToolApprovalMode] = [:],
+        extraAuxiliary: Set<String> = []
     ) -> Expansion
 }
 ```
 
-Call `expand(...)` to resolve a policy against the live `MiddlewareCatalog` and get back the concrete sets of tools to disable and the per-tool approval modes to pass to `HumanInTheLoopMiddleware`.
+Call `expand(...)` to resolve a policy against the live `MiddlewareCatalog` and get back the concrete sets of tools to disable, the per-tool approval modes to pass to `HumanInTheLoopMiddleware`, and the `auxiliaryToolNames` to pass to `createDeepAgent`.
+
+### Tiers vs disabling
+
+A **disabled** tool is gone: never rendered, never dispatchable. An **auxiliary** tool is only unrendered - it stays fully callable, and the agent finds it through `search_tools`. The two are disjoint (`expand()` subtracts disabled names from the auxiliary set), and a tier never changes what a tool is *allowed* to do: an auxiliary write is still gated by its approval mode. See [Middleware → `ToolSearchMiddleware`](middleware.md#toolsearchmiddleware-lazy-tool-loading).
 
 ### `ToolApprovalMode`
 

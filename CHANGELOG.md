@@ -9,6 +9,59 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Added
 
+- **Lazy tool loading: `ToolSearchMiddleware`, so a tool's schema costs nothing until it is needed.**
+  Tools are tiered `core` (schema prefilled into every prompt) or `auxiliary` (not in the prompt at
+  all). The agent finds auxiliary tools with `search_tools`, which returns their names and signatures
+  as its *tool result*, and then calls them by name like any other tool. New `ToolTier`, four
+  `AgentToolPolicy` fields (`toolSearch`, `auxiliaryMiddleware`, `auxiliaryTools`, `coreMCPServers`)
+  plus `toolSearchModel` / `toolSearchLimit`, `MCPServerConfig.tier` (auxiliary by default - MCP
+  schemas are the verbose ones), and `createDeepAgent(auxiliaryToolNames:toolRetriever:toolSearchLimit:toolsetsByTool:)`.
+  Off by default: an existing policy decodes with tiers empty and behaves exactly as before.
+
+  The point of the design is that **the rendered tool set never changes**. `MlxChatModel` fingerprints
+  `systemPrompt + toolNames` and resets its whole prefix KV cache when either moves, and the schemas
+  render at the *front* of the prompt - so growing the tool list mid-run, the obvious implementation,
+  is the one thing that cannot be done cheaply. Instead the middleware applies a *constant* filter to
+  `ModelRequest.tools`, and everything discovery produces arrives as conversation content, which
+  appends past the cached tip. `ReactAgent` dispatches against its own tool list rather than the
+  request's, so an auxiliary tool is **invisible but executable** throughout. Editing a tier costs one
+  re-prefill; discovering a tool costs none.
+- **`ToolRetriever` and two implementations.** `LexicalToolRetriever` (in `DeepAgents`) ranks by
+  IDF-weighted term overlap and needs no model. `ColBERTToolRetriever` (in `DeepAgentsMLX`) runs
+  LFM2.5-ColBERT-350M late interaction on device - per-token 128-d projections scored by MaxSim -
+  via `MLXEmbedders`' `LFM2BidirectionalModel`. It supplies the three things that library leaves to
+  the caller: per-token L2 normalization, the `[Q] `/`[D] ` prefixes read from the model's own config,
+  and MaxSim itself. It encodes one text per forward pass on purpose: batching needs padding, and the
+  encoder deliberately does not mask it (a `0` means padding for a document but a kept expansion token
+  for a query), so padded documents would contribute junk tokens for MaxSim to match.
+- **`run_tool(name:, arguments:)`**, for a planner that will not emit a tool name absent from its own
+  schema. `wrapModelCall` rewrites the call into a direct call to the target before `ReactAgent`
+  normalizes, records, or dispatches it, so approvals, human-in-the-loop, and the message log all see
+  the real tool. Having `run_tool` execute the target itself was rejected: the inner call would run
+  inside `run_tool`'s own `wrapToolCall` chain and bypass the approval gate.
+- **`MlxModel.Kind.retriever`** and the two LFM2.5-ColBERT-350M catalog rows (8-bit, bf16), so the
+  retrieval encoders list, download, size, and delete like any other model. `MlxModel.languageCatalog`
+  now filters positively on `.language` - it was `!isVision`, which would have admitted a retriever
+  into the planner picker, where an encoder with no LM head fails at load rather than at selection.
+
+### Fixed
+
+- **Withholding a tool's schema now withholds the prose about it too.** Every capability middleware
+  appends a prompt section naming its own tools (~6 KB across 11 of them), and stripping
+  `ModelRequest.tools` never touched that. With `apple_notes` tiered auxiliary the prompt still said
+  *"You can read and write the user's Apple Notes - never claim you can't"* and *"to save a note you
+  must call `create_note`"* while no such schema was rendered: the agent recited tools it could not
+  call, then reached for an unrelated one. New `AgentMiddleware.contributesRenderedTools(to:)` gates
+  every guidance section on its tools actually being rendered, and the base deep-agent prompt's
+  `write_file` bullet is gated the same way. This is why `ToolSearchMiddleware` is registered **first**
+  in `createDeepAgent`'s stack - the outermost `wrapModelCall` - so the schemas are already gone before
+  anything that might describe them runs.
+- **The prompt-overhead estimate measures what the model actually sees.** `ReactAgent.renderedTools`
+  (public, and honoring the new `ToolRenderFiltering`) excludes withheld tools, so the summarization
+  trigger and context meter no longer count schemas that were never sent and fire compaction early.
+- **The unknown-tool error points at the way out**, naming `search_tools` when it is available instead
+  of leaving a bare list of names the model cannot see.
+
 - **A round's independent tool calls run concurrently.** `AgentTool.isParallelSafe` (default
   `false`) declares that a tool neither writes anything another call in the round could care about
   nor needs an earlier call's result. The loop splits a round into batches: each run of consecutive
