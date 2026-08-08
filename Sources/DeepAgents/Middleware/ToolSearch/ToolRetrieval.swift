@@ -97,7 +97,14 @@ extension ToolDocument {
                 toolset: toolset,
                 toolsetDisplayName: toolsetDisplay,
                 signature: signature(name: tool.name, parameters: parameters),
-                summary: entry?.tool.summary ?? tool.description,
+                // The tool's own `description`, never the catalog's `summary`. Both describe the tool,
+                // but for different readers: the summary is a label for a settings checkbox ("List
+                // available notes.") while the description is what the tool tells a *model* ("List the
+                // titles of the user's Apple Notes. Pass `query` to keep only titles containing…").
+                // The search result is read by the model, and the terse version dropped exactly the
+                // context it needs - a planner that had just been told "List available notes" went
+                // looking for a folder on disk. Both voices still feed `indexText` for retrieval.
+                summary: tool.description,
                 indexText: index,
                 parameters: parameters
             )

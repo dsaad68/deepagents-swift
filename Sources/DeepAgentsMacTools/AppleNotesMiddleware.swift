@@ -455,7 +455,11 @@ public struct ListNotesTool: AgentTool {
     public var parameters: [ToolParameter] {
         [
             .optional("query", type: .string, description: "Substring to filter titles by. Omit for all notes."),
-            .optional("folder", type: .string, description: "Folder name to list within. Omit for all folders.")
+            .optional(
+                "folder", type: .string,
+                description: "Name of a folder *inside Apple Notes* to list within (e.g. \"Recipes\"), "
+                    + "not a path on disk. Omit for all folders."
+            )
         ]
     }
 
@@ -493,7 +497,11 @@ public struct ReadNoteTool: AgentTool {
     public var parameters: [ToolParameter] {
         [
             .required("title", type: .string, description: "Text to find in the note's title."),
-            .optional("folder", type: .string, description: "Folder to search within. Omit for all folders."),
+            .optional(
+                "folder", type: .string,
+                description: "Name of a folder *inside Apple Notes* to search within, not a path on disk. "
+                    + "Omit for all folders."
+            ),
             .optional("index", type: .int, description: "When several notes match, the 1-based number of the one to read."),
             .optional("id", type: .string, description: "An exact note id from a previous result. When set, reads that note directly.")
         ]
@@ -539,7 +547,11 @@ public struct CreateNoteTool: AgentTool {
         [
             .required("title", type: .string, description: "The new note's title."),
             .required("body", type: .string, description: "The note's body text. Use \\n for line breaks."),
-            .optional("folder", type: .string, description: "Folder to create the note in. Omit for the default.")
+            .optional(
+                "folder", type: .string,
+                description: "Name of a folder *inside Apple Notes* to create the note in, not a path on "
+                    + "disk. Omit for the default folder."
+            )
         ]
     }
 
@@ -584,7 +596,11 @@ public struct UpdateNoteTool: AgentTool {
                 description: "\"replace\" overwrites the body; \"append\" adds to the end.",
                 extraProperties: ["enum": ["replace", "append"]]
             ),
-            .optional("folder", type: .string, description: "Folder to search within. Omit for all folders."),
+            .optional(
+                "folder", type: .string,
+                description: "Name of a folder *inside Apple Notes* to search within, not a path on disk. "
+                    + "Omit for all folders."
+            ),
             .optional("index", type: .int, description: "When several notes match, the 1-based number of the one to update."),
             .optional("id", type: .string, description: "An exact note id from a previous result. When set, updates that note directly.")
         ]

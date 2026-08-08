@@ -61,6 +61,20 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   rejects a wrong value - a wasted round otherwise. Parameters are ordered required-first, then optional
   alphabetically: JSON schema properties arrive unordered, so without a rule the signature (and the
   document text the retriever caches) would differ between runs.
+- **The search result shows the tool's own description, and explains every parameter.** It was showing
+  the catalog's `summary` - a label written for a settings checkbox ("List available notes.") - instead of
+  the `description` the tool publishes to models ("List the titles of the user's Apple Notes. Pass
+  `query` to keep only titles containing that text…"), dropping exactly the context a planner needs.
+  Optional parameters are now described too, not just required ones: an optional `folder` reads as a
+  path on disk to an agent that also holds filesystem tools, and the description is the only thing that
+  says otherwise. Relatedly, Apple Notes' four `folder` parameters now say "a folder *inside Apple
+  Notes*… not a path on disk".
+- **A crowded search result drops detail before it drops tools.** Room is reserved for every match's
+  signature first, then the remaining budget upgrades the best-ranked ones to full parameter detail.
+  Filling greedily with full entries looked equivalent and was not: a few verbose tools consumed the
+  whole budget and the tail was omitted outright rather than abbreviated - the opposite of the intended
+  degradation, since a tool listed with a bare signature can still be called while an omitted one cannot
+  be found at all.
 - **The prompt names auxiliary *areas*, not auxiliary tools.** A brief experiment listed every auxiliary
   tool's name in the prompt (`Apple Notes: create_note, list_notes, …`); it is gone. Discoverability
   only needs the area - the model must know a notes capability might exist, not that the tool is spelled

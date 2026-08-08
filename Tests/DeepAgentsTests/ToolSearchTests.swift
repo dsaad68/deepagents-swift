@@ -807,9 +807,30 @@ struct ToolSignatureTests {
         #expect(text.contains("`arg!` must be passed")) // the legend
         #expect(text.contains("update_note(title!: string"))
         #expect(text.contains("title! - Title of the note to update."))
-        // Optional parameters stay name-and-type; the budget is spent where a wrong guess fails.
-        #expect(!text.contains("index? - "))
+        // Optional parameters are explained too. That is where a plausible-but-wrong guess lives - an
+        // optional `folder` reads as a disk path to an agent that also has filesystem tools - and the
+        // description is the only thing that says otherwise.
+        #expect(text.contains("index? - Which match to use."))
     }
+}
+
+/// A tool with enough parameter prose to exhaust the result budget in a handful of entries.
+private struct VerboseTool: AgentTool {
+    let index: Int
+    var name: String { "verbose_tool_\(index)" }
+    var description: String { "A verbose tool for exercising the result budget." }
+    var parameters: [ToolParameter] {
+        (0 ..< 4).map { number in
+            .optional(
+                "argument\(number)", type: .string,
+                description: String(repeating: "long description text ", count: 6)
+            )
+        }
+    }
+
+    func execute(
+        _ arguments: [String: AgentJSON], _ context: ToolContext
+    ) async throws -> ToolOutput { ToolOutput("ok") }
 }
 
 @Suite("search_tools results")
@@ -843,6 +864,36 @@ struct SearchToolsResultTests {
         let text = try await result(query: "zzzz qqqq")
 
         #expect(text.contains("search_tools again") || text.contains("different words"))
+    }
+
+    @Test("An Apple Notes folder is not described as a path on disk")
+    func notesFolderIsUnambiguous() async throws {
+        // The concrete confusion this guards: an agent holding filesystem tools reads `folder` as a
+        // directory. Only the parameter description distinguishes them, so it has to reach the model.
+        let corpus = ToolDocument.corpus(for: AppleNotesMiddleware().tools)
+        let tool = SearchToolsTool(documents: corpus, retriever: LexicalToolRetriever(), limit: 5)
+        let text = try await tool.execute(["query": .string("list notes")], ToolContext()).content
+
+        #expect(text.contains("folder? - "))
+        #expect(text.contains("inside Apple Notes"))
+        #expect(text.contains("not a path on disk"))
+        // And the model-facing description, not the settings label ("List available notes.").
+        #expect(text.contains("titles of the user's Apple Notes"))
+    }
+
+    @Test("Running short drops parameter detail before it drops tools")
+    func degradesByAbbreviatingNotOmitting() async throws {
+        // A tool listed with a bare signature can still be called; a tool omitted cannot be found.
+        let many = (0 ..< 8).map { VerboseTool(index: $0) }
+        let tool = SearchToolsTool(
+            documents: ToolDocument.corpus(for: many), retriever: LexicalToolRetriever(), limit: 8
+        )
+        let text = try await tool.execute(["query": .string("verbose")], ToolContext()).content
+
+        #expect(text.contains("without parameter detail"))
+        #expect(!text.contains("omitted to stay within")) // nothing dropped entirely
+        for index in 0 ..< 8 { #expect(text.contains("verbose_tool_\(index)")) }
+        #expect(text.count < ReactAgent.maxToolResultCharacters)
     }
 
     @Test("The result stays inside the tool-result truncation limit")

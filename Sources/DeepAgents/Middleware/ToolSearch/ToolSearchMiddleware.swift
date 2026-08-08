@@ -240,20 +240,51 @@ struct SearchToolsTool: AgentTool {
             + "In the signatures below `arg!` must be passed and `arg?` is optional.", ""]
         var used = lines.joined(separator: "\n").count
         var omitted = 0
-        for match in matches {
-            guard let document = byName[match.name] else { continue }
-            var entry = "  \(document.signature)\n      \(document.summary)"
-            // Spell out the mandatory arguments. Optional ones are left to name and type: these are
-            // the ones a wrong guess fails on, and the budget is better spent here than everywhere.
-            for parameter in document.parameters where parameter.isRequired && !parameter.description.isEmpty {
-                entry += "\n      \(parameter.label) - \(parameter.description)"
+        var abbreviated = 0
+
+        // Two renderings per tool. The full one explains every parameter - including the optional ones,
+        // because that is where a plausible-but-wrong guess lives: `list_notes(folder?)` reads like a
+        // disk path to an agent that also has filesystem tools, and only the description says otherwise.
+        // The compact one is signature and purpose alone.
+        let entries = matches.compactMap { byName[$0.name] }.map { document -> (compact: String, full: String) in
+            let compact = "  \(document.signature)\n      \(document.summary)"
+            var full = compact
+            for parameter in document.parameters where !parameter.description.isEmpty {
+                full += "\n      \(parameter.label) - \(parameter.description)"
             }
-            if used + entry.count > Self.resultBudget {
+            return (compact, full)
+        }
+
+        // Reserve room for every match's compact form *first*, then spend what is left upgrading the
+        // best-ranked ones to full detail. Filling greedily with full entries instead looks equivalent
+        // and is not: a few verbose tools consume the whole budget and the tail gets dropped entirely
+        // rather than abbreviated - the opposite of the intended degradation, since a tool listed with a
+        // bare signature can still be called while an omitted one cannot be found at all.
+        var rendered: [String] = []
+        for entry in entries {
+            guard used + entry.compact.count <= Self.resultBudget else {
                 omitted += 1
                 continue
             }
-            used += entry.count + 1
-            lines.append(entry)
+            used += entry.compact.count + 1
+            rendered.append(entry.compact)
+        }
+        for index in rendered.indices {
+            let delta = entries[index].full.count - entries[index].compact.count
+            if used + delta <= Self.resultBudget {
+                used += delta
+                rendered[index] = entries[index].full
+            } else {
+                abbreviated += 1
+            }
+        }
+        lines += rendered
+        if abbreviated > 0 {
+            lines.append("")
+            lines.append(
+                "(\(abbreviated) of these are listed without parameter detail to stay within the result "
+                    + "size - search for one by name to see it in full.)"
+            )
         }
         lines.append("")
         if omitted > 0 { lines.append("(\(omitted) further match(es) omitted to stay within the result size.)") }
